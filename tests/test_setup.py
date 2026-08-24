@@ -5,6 +5,7 @@ All data here is synthetic. Nothing touches the network, `gh`, or a real HOME.
 
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timezone
 
 import pytest
@@ -14,6 +15,16 @@ from vibe_clock.cli import init, render, setup, workflow
 from vibe_clock.config import Config
 from vibe_clock.models import AgentStats
 from vibe_clock.workflow import WORKFLOW_PATH, readme_snippet, workflow_yaml
+
+def _split_runner() -> CliRunner:
+    """A runner that keeps stdout and stderr apart, across click versions.
+
+    click < 8.2 mixes them unless told not to; 8.2 dropped the argument and
+    splits by default.
+    """
+    if "mix_stderr" in inspect.signature(CliRunner.__init__).parameters:
+        return CliRunner(mix_stderr=False)
+    return CliRunner()
 
 
 def _stats() -> AgentStats:
@@ -285,14 +296,84 @@ def test_workflow_command_prints_what_setup_would_write(monkeypatch) -> None:
     assert result.output == workflow_yaml()
 
 
-def test_workflow_command_rejects_charts_without_their_data(monkeypatch) -> None:
+def test_workflow_command_rejects_an_unknown_chart(monkeypatch) -> None:
     monkeypatch.setattr("vibe_clock.cli.load_config", lambda: Config())
-    result = CliRunner().invoke(workflow, ["--charts", "heatmap"])
+    result = CliRunner().invoke(workflow, ["--charts", "bogus"])
     assert result.exit_code != 0
-    assert "--daily-activity" in result.output
+    assert "bogus" in result.output
+
+
+def test_workflow_command_warns_on_unshared_data_without_failing(monkeypatch) -> None:
+    """Unlike `setup`, this command may be run on a machine that is not the one
+    that pushes, so its local privacy config is advisory, not authoritative."""
+    monkeypatch.setattr("vibe_clock.cli.load_config", lambda: Config())
+
+    result = _split_runner().invoke(workflow, ["--charts", "heatmap"])
+
+    assert result.exit_code == 0
+    assert "--daily-activity" in result.stderr
+    # The YAML must stay clean, so `vibe-clock workflow > file` still works.
+    assert result.stdout == workflow_yaml(chart_types="heatmap")
 
 
 def test_readme_snippet_names_the_files_the_action_writes() -> None:
     snippet = readme_snippet("card,donut")
     assert "images/vibe-clock-card.svg" in snippet
     assert "images/vibe-clock-donut.svg" in snippet
+
+
+# --------------------------------------------------------------------------
+# scheduling
+# --------------------------------------------------------------------------
+
+
+def test_schedule_explains_an_unsupported_platform(monkeypatch) -> None:
+    """On Windows `get_scheduler()` raises. That used to surface as an
+    unhandled traceback with no hint that WSL is the answer."""
+    from vibe_clock.cli import schedule
+
+    config = Config()
+    config.github.token = "synthetic-token"
+    config.privacy.public_sharing_enabled = True
+    monkeypatch.setattr("vibe_clock.cli.load_config", lambda: config)
+    monkeypatch.setattr("vibe_clock.cli.save_config", lambda c: None)
+
+    def no_backend():
+        raise RuntimeError("No supported scheduler found.")
+
+    monkeypatch.setattr("vibe_clock.scheduler.get_scheduler", no_backend)
+
+    result = CliRunner().invoke(schedule, [])
+
+    assert result.exit_code == 0
+    assert result.exception is None
+    assert "WSL" in result.output
+
+
+def test_schedule_warns_systemd_users_about_lingering(monkeypatch) -> None:
+    """A user timer stops at logout unless lingering is enabled, which silently
+    freezes the profile on a headless machine."""
+    from vibe_clock.cli import schedule
+
+    config = Config()
+    config.github.token = "synthetic-token"
+    config.privacy.public_sharing_enabled = True
+    monkeypatch.setattr("vibe_clock.cli.load_config", lambda: config)
+    monkeypatch.setattr("vibe_clock.cli.save_config", lambda c: None)
+
+    class FakeSystemd:
+        backend_name = "systemd"
+
+        def is_scheduled(self):
+            return False
+
+        def schedule(self, binary, interval, run_time):
+            return "systemctl --user status vibe-clock-push.timer"
+
+    monkeypatch.setattr("vibe_clock.scheduler.get_scheduler", lambda: FakeSystemd())
+    monkeypatch.setattr("vibe_clock.scheduler.resolve_binary", lambda: "/usr/bin/vibe-clock")
+
+    result = CliRunner().invoke(schedule, [])
+
+    assert result.exit_code == 0
+    assert "enable-linger" in result.output

@@ -52,6 +52,8 @@ from .workflow import (
 )
 
 console = Console()
+# Warnings go to stderr so `vibe-clock workflow > file` captures only the YAML.
+err_console = Console(stderr=True)
 
 # Every renderer branches on `theme == "dark"`, so an unrecognised value used to
 # render light without saying so.
@@ -127,7 +129,10 @@ def summary(days: int | None) -> None:
 
     collectors = get_collectors(config)
     if not collectors:
-        console.print("[yellow]No agent data found. Run 'vibe-clock init' first.[/yellow]")
+        console.print(
+            "[yellow]No agent data found. Check that an agent has written logs, "
+            "then run 'vibe-clock setup'.[/yellow]"
+        )
         return
 
     all_sessions = []
@@ -283,7 +288,7 @@ def status(days: int | None) -> None:
 
     collectors = get_collectors(config)
     if not collectors:
-        click.echo("No agent data found. Run 'vibe-clock init' first.")
+        click.echo("No agent data found. Check that an agent has written logs, then run 'vibe-clock setup'.")
         return
 
     all_sessions = []
@@ -771,7 +776,10 @@ def _step(number: int, title: str) -> None:
 def _resolve_token(config: Config, assume_yes: bool) -> str:
     """Find a GitHub token, preferring one `gh` already holds."""
     if config.github.token:
-        console.print("  [green]✓[/green] Using the token already in your config")
+        console.print(
+            "  [green]✓[/green] Using the token already configured "
+            f"({CONFIG_PATH}, or $GITHUB_TOKEN)"
+        )
         return config.github.token
 
     if gh.is_available():
@@ -830,8 +838,8 @@ def _resolve_profile_repo(config: Config, given: str | None, assume_yes: bool) -
     return candidate
 
 
-def _requested_charts(charts: str, privacy) -> list[str]:
-    """Validate chart names, and that the data each one needs is being shared."""
+def _chart_names(charts: str) -> list[str]:
+    """Parse and validate a --charts list."""
     names = [t.strip() for t in charts.split(",") if t.strip()]
     if not names:
         raise click.ClickException("--charts must name at least one chart")
@@ -840,19 +848,17 @@ def _requested_charts(charts: str, privacy) -> list[str]:
         raise click.ClickException(
             f"unknown chart type(s): {', '.join(unknown)}. Valid: {', '.join(SVG_RENDERERS)}."
         )
-    # Catching this now beats letting the workflow fail on its first run — or,
-    # worse, drawing an empty chart from data that was never shared.
-    problems = [
+    return names
+
+
+def _unshared_chart_data(names: list[str], privacy) -> list[str]:
+    """Charts among `names` whose data these privacy settings never publish."""
+    return [
         f"chart '{n}' needs {req.label}; add {req.flag}"
         for n in names
         for req in SVG_RENDERERS[n][2]
         if not getattr(privacy, req.privacy_attr)
     ]
-    if problems:
-        raise click.ClickException(
-            "\n".join(problems) + "\n(or drop those charts from --charts)"
-        )
-    return names
 
 
 def _git_slug(path: Path) -> str | None:
@@ -950,7 +956,14 @@ def setup(
     config.privacy.share_token_counts = token_counts
     config.privacy.share_time_patterns = time_patterns
     config.privacy.share_project_aliases = project_aliases
-    _requested_charts(charts, config.privacy)
+    # Catching this now beats letting the workflow fail on its first run — or,
+    # worse, drawing an empty chart from data that was never shared. Here the
+    # config being checked is definitely the one this machine will push with.
+    problems = _unshared_chart_data(_chart_names(charts), config.privacy)
+    if problems:
+        raise click.ClickException(
+            "\n".join(problems) + "\n(or drop those charts from --charts)"
+        )
 
     if config.github.gist_id and not config.privacy.public_sharing_enabled:
         raise click.ClickException(
@@ -1024,7 +1037,18 @@ def _print_manual_secret(profile_repo: str, gist_id: str) -> None:
 @click.option("--write", is_flag=True, help=f"Write {WORKFLOW_PATH} instead of printing it.")
 def workflow(charts: str, write: bool) -> None:
     """Print the GitHub Actions workflow to install in your profile repo."""
-    _requested_charts(charts, load_config().privacy)
+    names = _chart_names(charts)
+    # A warning rather than an error: the machine printing a workflow file is
+    # not necessarily the machine that pushes, so this config may not be the
+    # one that decides. Say which config was consulted.
+    problems = _unshared_chart_data(names, load_config().privacy)
+    for problem in problems:
+        err_console.print(f"[yellow]![/yellow] {problem}")
+    if problems:
+        err_console.print(
+            f"[dim]  (checked {CONFIG_PATH} on this machine; the workflow will "
+            "fail unless the machine that pushes shares this data)[/dim]"
+        )
     yaml = workflow_yaml(chart_types=charts)
     if not write:
         click.echo(yaml, nl=False)
