@@ -14,36 +14,70 @@ from vibe_clock.models import AgentStats, Session, TokenUsage
 from vibe_clock.payload import SCHEMA_VERSION
 
 
-def test_local_render_keeps_full_configured_stats(monkeypatch, tmp_path) -> None:
-    config = Config(default_days=30)
+def _render_locally(monkeypatch, tmp_path, config, *args):
+    """Run `vibe-clock render` (no --from-json) over one private session."""
     session = Session(
         session_id="local",
         agent="codex",
-        start_time=datetime.now(timezone.utc) - timedelta(hours=1),
-        end_time=datetime.now(timezone.utc),
-        model="gpt-private-model",
-        project="private-project",
+        # Yesterday: the public window ends at the last complete UTC midnight,
+        # so today's activity is not published and must not be rendered either.
+        start_time=datetime.now(timezone.utc) - timedelta(days=1, hours=2),
+        end_time=datetime.now(timezone.utc) - timedelta(days=1, hours=1),
+        model="gpt-private-model-unreleased",
+        project="/Volumes/work/AcmeCorp-nda-project",
         message_count=4,
         tokens=TokenUsage(input_tokens=1000, output_tokens=500),
     )
 
     class Collector:
+        agent_name = "codex"
+
         def collect(self, days: int = 365) -> list[Session]:
-            assert days == 30
             return [session]
 
     monkeypatch.setattr("vibe_clock.cli.load_config", lambda: config)
     monkeypatch.setattr("vibe_clock.cli.get_collectors", lambda _config: [Collector()])
+    return CliRunner().invoke(render, [*args, "--output", str(tmp_path)])
 
-    result = CliRunner().invoke(
-        render,
-        ["--type", "token_bars", "--output", str(tmp_path)],
+
+def test_local_render_cannot_leak_a_private_project_or_model(monkeypatch, tmp_path) -> None:
+    """`render` without --from-json used to bypass the sanitizer entirely.
+
+    It handed raw `AgentStats` to the renderers, so `bars` drew the working
+    directory as a label and `card`/`donut`/`token_bars` printed the raw model
+    ID — into files the README tells you to commit to a public profile repo.
+    """
+    config = Config(default_days=30)
+    config.privacy.share_token_counts = True
+    config.privacy.share_project_aliases = True
+
+    result = _render_locally(
+        monkeypatch, tmp_path, config, "--type", "token_bars,bars,card,donut"
     )
 
-    assert result.exit_code == 0
-    svg = (tmp_path / "vibe-clock-token-bars.svg").read_text()
-    assert "gpt-private-model" in svg
-    assert "No token data" not in svg
+    assert result.exit_code == 0, result.output
+    for svg_path in tmp_path.glob("*.svg"):
+        svg = svg_path.read_text()
+        assert "gpt-private-model-unreleased" not in svg, svg_path.name
+        assert "AcmeCorp" not in svg, svg_path.name
+        assert "/Volumes" not in svg, svg_path.name
+
+    assert "OpenAI" in (tmp_path / "vibe-clock-donut.svg").read_text()
+    assert "Project A" in (tmp_path / "vibe-clock-bars.svg").read_text()
+    assert "No token data" not in (tmp_path / "vibe-clock-token-bars.svg").read_text()
+
+
+def test_local_render_refuses_a_chart_whose_data_is_not_published(
+    monkeypatch, tmp_path
+) -> None:
+    """The README promises this for every render, not only the CI one."""
+    config = Config(default_days=30)  # every share flag off
+
+    result = _render_locally(monkeypatch, tmp_path, config, "--type", "bars")
+
+    assert result.exit_code != 0
+    assert "--project-aliases" in result.output
+    assert not list(tmp_path.glob("*.svg"))
 
 
 def _write_payload(tmp_path, **overrides):

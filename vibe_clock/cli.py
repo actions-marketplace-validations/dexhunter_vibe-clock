@@ -35,7 +35,7 @@ from .payload import (
     missing_requirements,
     to_agent_stats,
 )
-from .sanitizer import preview, public_payload
+from .sanitizer import build_public_payload, preview, public_payload
 from .svg.bars import render_bars
 from .svg.card import render_card
 from .svg.donut import render_donut
@@ -352,14 +352,19 @@ def render(chart_type: str, output_dir: str, json_path: str | None, theme: str |
             f"  [dim]payload schema v{payload.schema_version} "
             f"from vibe-clock {payload.producer_version}[/dim]"
         )
-        _require_shared_data(payload, types)
+        _require_shared_data(payload, types, where="on the machine that pushes")
         stats = to_agent_stats(payload)
     else:
-        collectors = get_collectors(config)
-        all_sessions = []
-        for collector in collectors:
-            all_sessions.extend(collector.collect(days=config.default_days))
-        stats = aggregate(all_sessions, config)
+        # Local rendering goes through the *same* public payload as CI, never
+        # the raw aggregate. An SVG is a file the README tells you to commit to
+        # a public repo, so it must not be able to carry anything the published
+        # JSON could not: `bars` used to draw the raw working directory as its
+        # label, and `card`/`donut`/`token_bars` printed the raw model ID —
+        # both of which the privacy contract says are never published under any
+        # flag. `vibe-clock export` remains the unsanitized local view.
+        payload = build_public_payload(_collect_public_stats(config), config)
+        _require_shared_data(payload, types)
+        stats = to_agent_stats(payload)
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -372,13 +377,14 @@ def render(chart_type: str, output_dir: str, json_path: str | None, theme: str |
         console.print(f"  [green]✓[/green] {path}")
 
 
-def _require_shared_data(payload, types: list[str]) -> None:
+def _require_shared_data(payload, types: list[str], *, where: str = "") -> None:
     """Refuse to draw a chart from data the payload does not carry.
 
     Rendering an empty heatmap from a payload that simply never shared daily
     activity looks like "you did nothing for a year". Failing names the flag
     that fixes it.
     """
+    suffix = f" {where}" if where else ""
     problems: list[str] = []
     for t in types:
         entry = SVG_RENDERERS.get(t)
@@ -386,8 +392,8 @@ def _require_shared_data(payload, types: list[str]) -> None:
             continue
         for req in missing_requirements(payload, entry[2]):
             problems.append(
-                f"chart '{t}' needs {req.label}, which this payload does not share"
-                f" — re-run `vibe-clock share {req.flag}` on the machine that pushes"
+                f"chart '{t}' needs {req.label}, which is not published"
+                f" — run `vibe-clock share {req.flag}`{suffix}"
             )
     if problems:
         raise click.ClickException("\n".join(problems))
