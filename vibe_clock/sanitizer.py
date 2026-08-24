@@ -240,18 +240,50 @@ def _make_label(idx: int) -> str:
     return f"Project {letters[idx // 26 - 1]}{letters[idx % 26]}"
 
 
-def _validate_no_pii(stats: AgentStats) -> None:
-    """Fail closed if a local identity or home path reaches the safe view."""
-    json_str = stats.model_dump_json()
-    blocked_values = {_HOME_DIR, f"/home/{_USERNAME}", f"/Users/{_USERNAME}"}
-    for blocked in blocked_values:
-        if blocked and blocked in json_str:
-            raise ValueError(f"PII leak detected in public stats: {blocked!r}")
+def _free_text_values(stats: AgentStats) -> list[str]:
+    """Every string in the safe view that was derived from the user's machine.
 
-    if len(_USERNAME) >= 3:
-        pattern = re.compile(rf"(?<![a-zA-Z]){re.escape(_USERNAME)}(?![a-zA-Z])")
-        if pattern.search(json_str):
-            raise ValueError("PII leak detected in public stats: local username")
+    Deliberately not "the whole JSON". The remaining strings are constants this
+    module wrote — the four agent names, the model-family allowlist, `Project A`
+    — and scanning them made the guard fire on the tool's own output: a user
+    whose Unix login is `code` or `claude` matched `claude_code` in
+    ``active_agents`` and could never publish at all.
+    """
+    values = [stats.favorite_model]
+    values.extend(item.model for item in stats.models)
+    for item in stats.projects:
+        values.extend((item.project, item.agent))
+    return [value for value in values if value]
+
+
+def _validate_no_pii(stats: AgentStats) -> None:
+    """Assert that the mapping above actually ran, before anything is published.
+
+    This is a backstop, not a second filter: the allowlist in `sanitize` is what
+    makes the payload safe, and this only re-checks the fields that carry
+    user-derived text. It exists so that a future edit which lets a raw project
+    directory or model ID through fails here, loudly and locally, instead of on
+    a public Gist. Reaching it means vibe-clock has a bug.
+    """
+    blocked_values = {_HOME_DIR, f"/home/{_USERNAME}", f"/Users/{_USERNAME}"}
+    username_pattern = (
+        re.compile(rf"(?<![a-zA-Z]){re.escape(_USERNAME)}(?![a-zA-Z])")
+        if len(_USERNAME) >= 3
+        else None
+    )
+
+    for value in _free_text_values(stats):
+        for blocked in blocked_values:
+            if blocked and blocked in value:
+                raise ValueError(
+                    f"vibe-clock bug: {blocked!r} reached the public payload via "
+                    f"{value!r}. Nothing was published; please open an issue."
+                )
+        if username_pattern is not None and username_pattern.search(value):
+            raise ValueError(
+                "vibe-clock bug: your local username reached the public payload "
+                f"via {value!r}. Nothing was published; please open an issue."
+            )
 
 
 def preview(stats: AgentStats, config: Config) -> str:
