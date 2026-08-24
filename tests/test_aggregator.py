@@ -9,6 +9,7 @@ from vibe_clock.aggregator import aggregate
 from vibe_clock.config import Config
 from vibe_clock.intervals import intervals_from_timestamps
 from vibe_clock.models import AgentStats, Session, TokenUsage
+from vibe_clock.payload import SCHEMA_VERSION, load_public_payload
 from vibe_clock.sanitizer import preview, public_payload, sanitize
 
 
@@ -284,27 +285,27 @@ def test_public_payload_is_allowlisted() -> None:
 
     assert set(payload) == {
         "schema_version",
+        "producer_version",
         "generated_at",
         "days_covered",
         "active_days",
         "total_sessions",
+        "total_minutes",
         "active_agents",
-        "agents",
         "favorite_model",
         "models",
     }
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == SCHEMA_VERSION
     assert payload["favorite_model"] == "OpenAI"
     assert set(payload["models"][0]) == {"model", "session_count"}
-    assert payload["agents"] == [{"agent": "claude_code", "session_count": 1}]
     assert "secret-project" not in serialized
     assert "private-alias" not in serialized
     assert "total_tokens" not in payload
     assert "daily" not in payload
     assert "hourly" not in payload
-    rendered_stats = AgentStats.model_validate(payload)
-    assert rendered_stats.total_sessions == 1
-    assert rendered_stats.models[0].model == "OpenAI"
+    loaded = load_public_payload(serialized)
+    assert loaded.total_sessions == 1
+    assert loaded.models[0].model == "OpenAI"
 
 
 def test_preview_contains_the_exact_public_payload() -> None:

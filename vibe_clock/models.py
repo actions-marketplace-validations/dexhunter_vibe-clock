@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .intervals import Interval, merge_intervals, total_minutes
 
@@ -79,7 +79,15 @@ class ProjectBreakdown(BaseModel):
 
 
 class AgentStats(BaseModel):
-    """Top-level aggregated stats — this is what gets pushed to the gist."""
+    """Top-level aggregated stats, internal to one vibe-clock version.
+
+    The published wire format is `payload.PublicPayload`, not this model: every
+    field here has a default, so validating foreign JSON against it would turn
+    a missing field into a plausible-looking zero. Unknown keys are rejected so
+    a renamed field is caught here too.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     days_covered: int = 30

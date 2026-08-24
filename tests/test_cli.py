@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from click.testing import CliRunner
 from vibe_clock.cli import init, push, render, schedule, share, unshare
 from vibe_clock.config import Config
 from vibe_clock.models import AgentStats, Session, TokenUsage
+from vibe_clock.payload import SCHEMA_VERSION
 
 
 def test_local_render_keeps_full_configured_stats(monkeypatch, tmp_path) -> None:
@@ -42,6 +44,76 @@ def test_local_render_keeps_full_configured_stats(monkeypatch, tmp_path) -> None
     svg = (tmp_path / "vibe-clock-token-bars.svg").read_text()
     assert "gpt-private-model" in svg
     assert "No token data" not in svg
+
+
+def _write_payload(tmp_path, **overrides):
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "producer_version": "1.5.0",
+        "generated_at": "2026-02-24T00:00:00Z",
+        "days_covered": 7,
+        "active_days": 5,
+        "total_sessions": 12,
+        "total_minutes": 321.0,
+        "active_agents": ["claude_code"],
+        "favorite_model": "Claude",
+        "models": [{"model": "Claude", "session_count": 12}],
+    }
+    payload.update(overrides)
+    path = tmp_path / "vibe-clock-data.json"
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_render_from_json_refuses_a_payload_written_by_an_older_vibe_clock(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr("vibe_clock.cli.load_config", lambda: Config())
+    # A v1.3.0-shaped document: no schema_version, and no active_days at all.
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"total_sessions": 1294, "days_covered": 30}))
+
+    result = CliRunner().invoke(
+        render, ["--from-json", str(legacy), "--output", str(tmp_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "no schema_version" in result.output
+    assert "vibe-clock push" in result.output
+    assert not (tmp_path / "vibe-clock-card.svg").exists()
+
+
+def test_render_from_json_refuses_charts_whose_data_was_not_shared(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr("vibe_clock.cli.load_config", lambda: Config())
+    path = _write_payload(tmp_path)
+
+    result = CliRunner().invoke(
+        render,
+        ["--from-json", str(path), "--type", "heatmap", "--output", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "daily activity" in result.output
+    assert "--daily-activity" in result.output
+    assert not (tmp_path / "vibe-clock-heatmap.svg").exists()
+
+
+def test_render_from_json_draws_the_card_from_always_shared_fields(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr("vibe_clock.cli.load_config", lambda: Config())
+    path = _write_payload(tmp_path)
+
+    result = CliRunner().invoke(
+        render,
+        ["--from-json", str(path), "--type", "card", "--output", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    svg = (tmp_path / "vibe-clock-card.svg").read_text()
+    assert ">5</text>" in svg  # active days, not a silent 0
 
 
 def test_init_detects_gemini_cli(monkeypatch, tmp_path) -> None:

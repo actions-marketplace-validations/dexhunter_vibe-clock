@@ -24,6 +24,17 @@ from .collectors import COLLECTOR_MAP, get_collectors
 from .formatting import format_bar, format_hourly_chart, format_hours, format_number
 from .config import Config, load_config, save_config
 from .models import AgentStats
+from .payload import (
+    DAILY_ACTIVITY,
+    PROJECT_ALIASES,
+    TIME_PATTERNS,
+    TOKEN_COUNTS,
+    PayloadError,
+    Requirement,
+    load_public_payload,
+    missing_requirements,
+    to_agent_stats,
+)
 from .sanitizer import preview, public_payload
 from .svg.bars import render_bars
 from .svg.card import render_card
@@ -35,14 +46,15 @@ from .svg.weekly import render_weekly
 
 console = Console()
 
-SVG_RENDERERS = {
-    "card": ("vibe-clock-card.svg", render_card),
-    "heatmap": ("vibe-clock-heatmap.svg", render_heatmap),
-    "donut": ("vibe-clock-donut.svg", render_donut),
-    "bars": ("vibe-clock-bars.svg", render_bars),
-    "token_bars": ("vibe-clock-token-bars.svg", render_token_bars),
-    "hourly": ("vibe-clock-hourly.svg", render_hourly),
-    "weekly": ("vibe-clock-weekly.svg", render_weekly),
+# filename, renderer, and the shared data the chart cannot be drawn without.
+SVG_RENDERERS: dict[str, tuple[str, object, tuple[Requirement, ...]]] = {
+    "card": ("vibe-clock-card.svg", render_card, ()),
+    "heatmap": ("vibe-clock-heatmap.svg", render_heatmap, (DAILY_ACTIVITY,)),
+    "donut": ("vibe-clock-donut.svg", render_donut, ()),
+    "bars": ("vibe-clock-bars.svg", render_bars, (PROJECT_ALIASES,)),
+    "token_bars": ("vibe-clock-token-bars.svg", render_token_bars, (TOKEN_COUNTS,)),
+    "hourly": ("vibe-clock-hourly.svg", render_hourly, (TIME_PATTERNS,)),
+    "weekly": ("vibe-clock-weekly.svg", render_weekly, (DAILY_ACTIVITY,)),
 }
 
 
@@ -289,9 +301,23 @@ def render(chart_type: str, output_dir: str, json_path: str | None, theme: str |
     config = load_config()
     th = theme or config.theme
 
+    types = (
+        list(SVG_RENDERERS.keys())
+        if chart_type == "all"
+        else [t.strip() for t in chart_type.split(",")]
+    )
+
     if json_path:
-        with open(json_path) as f:
-            stats = AgentStats.model_validate_json(f.read())
+        try:
+            payload = load_public_payload(Path(json_path).read_text())
+        except PayloadError as exc:
+            raise click.ClickException(str(exc)) from exc
+        console.print(
+            f"  [dim]payload schema v{payload.schema_version} "
+            f"from vibe-clock {payload.producer_version}[/dim]"
+        )
+        _require_shared_data(payload, types)
+        stats = to_agent_stats(payload)
     else:
         collectors = get_collectors(config)
         all_sessions = []
@@ -302,16 +328,36 @@ def render(chart_type: str, output_dir: str, json_path: str | None, theme: str |
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    types = list(SVG_RENDERERS.keys()) if chart_type == "all" else [t.strip() for t in chart_type.split(",")]
     for t in types:
         if t not in SVG_RENDERERS:
             console.print(f"[red]Unknown chart type: {t}[/red]")
             continue
-        filename, renderer = SVG_RENDERERS[t]
+        filename, renderer, _ = SVG_RENDERERS[t]
         svg = renderer(stats, theme=th)
         path = out / filename
         path.write_text(svg)
         console.print(f"  [green]✓[/green] {path}")
+
+
+def _require_shared_data(payload, types: list[str]) -> None:
+    """Refuse to draw a chart from data the payload does not carry.
+
+    Rendering an empty heatmap from a payload that simply never shared daily
+    activity looks like "you did nothing for a year". Failing names the flag
+    that fixes it.
+    """
+    problems: list[str] = []
+    for t in types:
+        entry = SVG_RENDERERS.get(t)
+        if entry is None:
+            continue
+        for req in missing_requirements(payload, entry[2]):
+            problems.append(
+                f"chart '{t}' needs {req.label}, which this payload does not share"
+                f" — re-run `vibe-clock share {req.flag}` on the machine that pushes"
+            )
+    if problems:
+        raise click.ClickException("\n".join(problems))
 
 
 @cli.command()

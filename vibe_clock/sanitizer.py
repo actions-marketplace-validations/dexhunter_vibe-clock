@@ -11,6 +11,7 @@ from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .config import Config
 from .models import (
     AgentStats,
@@ -18,6 +19,13 @@ from .models import (
     ModelBreakdown,
     ProjectBreakdown,
     TokenUsage,
+)
+from .payload import (
+    SCHEMA_VERSION,
+    PublicDaily,
+    PublicModel,
+    PublicPayload,
+    PublicProject,
 )
 
 _HOME_DIR = str(Path.home())
@@ -36,6 +44,7 @@ def sanitize(stats: AgentStats, config: Config) -> AgentStats:
         days_covered=stats.days_covered,
         active_days=stats.active_days,
         total_sessions=stats.total_sessions,
+        total_minutes=stats.total_minutes,
         total_messages=stats.total_messages if privacy.share_message_counts else 0,
         total_tokens=(
             stats.total_tokens.model_copy(deep=True)
@@ -55,92 +64,78 @@ def sanitize(stats: AgentStats, config: Config) -> AgentStats:
     return data
 
 
-def public_payload(stats: AgentStats, config: Config) -> dict[str, Any]:
-    """Serialize only fields enabled for the public profile."""
-    safe = sanitize(stats, config)
-    fields = {
-        "generated_at",
-        "days_covered",
-        "active_days",
-        "total_sessions",
-        "active_agents",
-        "favorite_model",
-        "models",
-    }
-    privacy = config.privacy
-    if privacy.share_daily_activity:
-        fields.add("daily")
-    if privacy.share_message_counts:
-        fields.add("total_messages")
-    if privacy.share_token_counts:
-        fields.add("total_tokens")
-    if privacy.share_time_patterns:
-        fields.update({"hourly", "peak_hour"})
-    if privacy.share_project_aliases:
-        fields.add("projects")
+def build_public_payload(stats: AgentStats, config: Config) -> PublicPayload:
+    """Build the typed public payload from an allowlisted, sanitized view.
 
-    payload = safe.model_dump(mode="json", include=fields)
-    payload["models"] = [
-        {
-            "model": item.model,
-            "session_count": item.session_count,
-            **(
-                {"message_count": item.message_count}
-                if privacy.share_message_counts
-                else {}
-            ),
-            **(
-                {"tokens": item.tokens.model_dump(mode="json")}
-                if privacy.share_token_counts
-                else {}
-            ),
-        }
-        for item in safe.models
-    ]
-    agent_counts: dict[str, int] = defaultdict(int)
-    for item in stats.projects:
-        if item.agent in _KNOWN_AGENTS:
-            agent_counts[item.agent] += item.session_count
-    payload["agents"] = [
-        {"agent": agent, "session_count": count}
-        for agent, count in sorted(
-            agent_counts.items(), key=lambda item: item[1], reverse=True
-        )
-    ]
-    if privacy.share_daily_activity:
-        payload["daily"] = [
-            {
-                "date": item.date.isoformat(),
-                "session_count": item.session_count,
-                **(
-                    {"message_count": item.message_count}
-                    if privacy.share_message_counts
-                    else {}
-                ),
-                **(
-                    {"tokens": item.tokens.model_dump(mode="json")}
-                    if privacy.share_token_counts
-                    else {}
-                ),
-            }
-            for item in safe.daily
-        ]
-    if privacy.share_project_aliases:
-        payload["projects"] = [
-            {
-                "project": item.project,
-                "agent": item.agent,
-                "session_count": item.session_count,
-                **(
-                    {"tokens": item.tokens.model_dump(mode="json")}
-                    if privacy.share_token_counts
-                    else {}
-                ),
-            }
-            for item in safe.projects
-        ]
-    payload["schema_version"] = 2
-    return payload
+    The emitted key set is derived from `PublicPayload`, so a field cannot live
+    on the contract and be forgotten by the serializer.
+    """
+    safe = sanitize(stats, config)
+    privacy = config.privacy
+    share_tokens = privacy.share_token_counts
+    share_messages = privacy.share_message_counts
+
+    return PublicPayload(
+        schema_version=SCHEMA_VERSION,
+        producer_version=__version__,
+        generated_at=safe.generated_at,
+        days_covered=safe.days_covered,
+        active_days=safe.active_days,
+        total_sessions=safe.total_sessions,
+        total_minutes=safe.total_minutes,
+        active_agents=list(safe.active_agents),
+        favorite_model=safe.favorite_model,
+        models=[
+            PublicModel(
+                model=item.model,
+                session_count=item.session_count,
+                message_count=item.message_count if share_messages else None,
+                tokens=item.tokens if share_tokens else None,
+            )
+            for item in safe.models
+        ],
+        daily=(
+            [
+                PublicDaily(
+                    date=item.date,
+                    session_count=item.session_count,
+                    message_count=item.message_count if share_messages else None,
+                    tokens=item.tokens if share_tokens else None,
+                )
+                for item in safe.daily
+            ]
+            if privacy.share_daily_activity
+            else None
+        ),
+        hourly=list(safe.hourly) if privacy.share_time_patterns else None,
+        peak_hour=safe.peak_hour if privacy.share_time_patterns else None,
+        total_messages=safe.total_messages if share_messages else None,
+        total_tokens=safe.total_tokens if share_tokens else None,
+        projects=(
+            [
+                PublicProject(
+                    project=item.project,
+                    agent=item.agent,
+                    session_count=item.session_count,
+                    tokens=item.tokens if share_tokens else None,
+                )
+                for item in safe.projects
+            ]
+            if privacy.share_project_aliases
+            else None
+        ),
+    )
+
+
+def public_payload(stats: AgentStats, config: Config) -> dict[str, Any]:
+    """Serialize only fields enabled for the public profile.
+
+    Unshared fields are omitted rather than sent as null or zero, so a reader
+    can tell "not shared" from "no activity".
+    """
+    return build_public_payload(stats, config).model_dump(
+        mode="json", exclude_none=True
+    )
 
 
 def _public_daily(stats: AgentStats, config: Config) -> list[DailyActivity]:

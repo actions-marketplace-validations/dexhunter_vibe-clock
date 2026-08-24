@@ -60,6 +60,10 @@ runs:
         THEME: ${{ inputs.theme }}
       run: |
         mkdir -p "${OUTPUT_DIR}"
+        # Print both sides of the producer/reader version pair, so a skew is
+        # readable in the log instead of inferred from a wrong-looking number.
+        vibe-clock --version
+        python -c "import json; d = json.load(open('/tmp/vibe-clock-data.json')); print('payload schema_version=%s producer_version=%s' % (d.get('schema_version'), d.get('producer_version')))"
         vibe-clock render --from-json /tmp/vibe-clock-data.json \
           --type "${CHART_TYPES}" --theme "${THEME}" --output "${OUTPUT_DIR}"
 
