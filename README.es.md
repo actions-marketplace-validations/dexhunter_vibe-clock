@@ -27,12 +27,24 @@ Tus agentes ya escriben registros de sesión en tu disco. vibe-clock los lee, ma
 uv tool install vibe-clock      # o: pipx install vibe-clock, o: pip install vibe-clock
 ```
 
+Este README documenta la versión **1.5.0 en adelante**; `vibe-clock setup` y `vibe-clock workflow` no existen en versiones anteriores. Compruébalo con `vibe-clock --version`.
+
 ```bash
 vibe-clock summary              # mira tus estadísticas en la terminal; nada sale de tu máquina
+
+cd ~/ruta/a/tu-repo-de-perfil   # setup escribe el workflow dentro de este checkout
 vibe-clock setup                # publícalas en tu perfil, cuando quieras
 ```
 
-Eso es todo. `vibe-clock setup` detecta tus agentes, toma prestado un token de `gh` si lo tienes, te muestra el JSON exacto que publicaría, crea el Gist, configura el secret del repositorio, escribe el archivo del workflow e instala el envío diario. **Cada paso que cambia algo fuera de tu máquina pregunta antes**, y cualquier paso que no pueda hacer por ti lo imprime como instrucciones.
+`vibe-clock setup` detecta tus agentes, toma prestado un token de `gh` si lo tienes, te muestra el JSON exacto que publicaría, crea el Gist, configura el secret del repositorio, escribe el archivo del workflow e instala el envío diario. **Cada paso que cambia algo fuera de tu máquina pregunta antes**, y cualquier paso que no pueda hacer por ti lo imprime como instrucciones.
+
+Quedan tres cosas para ti, porque son commits a tu propio repositorio y un botón en tu propio navegador:
+
+1. Añade las etiquetas `<img>` de más abajo al `README.md` de tu perfil — `setup` imprime el bloque exacto.
+2. Haz commit y push de eso y de `.github/workflows/vibe-clock.yml`.
+3. Ejecuta el workflow una vez desde la pestaña **Actions** del repositorio. A partir de ahí manda su cron.
+
+Si ejecutas `setup` desde otro sitio, imprime el YAML del workflow para que lo guardes a mano en vez de escribirlo — no escribe archivos en un directorio que no sea el repositorio que nombraste.
 
 <details>
 <summary>Otros métodos de instalación</summary>
@@ -79,7 +91,7 @@ Nada sale de tu máquina hasta que confirmas una vista previa. Vale la pena ser 
 - IDs de sesión, ramas o remotos de git, nombres de host, direcciones IP
 - Cualquier nombre de agente que no sea uno de los cuatro conocidos
 
-Dos mecanismos lo garantizan, no uno. La carga útil se construye a partir de una lista blanca explícita en [`sanitizer.py`](vibe_clock/sanitizer.py): un campo que no esté nombrado ahí no puede enviarse. Después, `_validate_no_pii` vuelve a examinar el JSON terminado y **lanza una excepción**, abortando el envío, si aparece en él la ruta de tu directorio personal o tu nombre de usuario.
+Lo que lo garantiza es la lista blanca de [`sanitizer.py`](vibe_clock/sanitizer.py): la carga útil se *construye* a partir de un conjunto fijo de campos, así que un campo que no esté nombrado ahí no puede enviarse; los nombres de proyecto se sustituyen por alias y los IDs de modelo se asignan a una lista cerrada de familias antes de serializar nada. Detrás está `_validate_no_pii`, una aserción de último recurso: vuelve a comprobar los pocos campos que llevan texto derivado de tu máquina y lanza una excepción en vez de publicar si tu ruta personal o tu nombre de usuario sobrevivieron a esa transformación. Está para convertir un fallo futuro en un error local en vez de en un Gist público; no es un segundo filtro independiente, y la garantía que debes leer es la lista blanca, no la aserción.
 
 Compruébalo tú mismo, antes de publicar nada:
 
@@ -89,7 +101,19 @@ vibe-clock push --dry-run       # imprime el JSON exacto, byte a byte, y no env�
 
 Para dejar de publicar: `vibe-clock unshare` borra el Gist junto con su historial de revisiones y desactiva las actualizaciones futuras. Ten en cuenta que un Gist público conserva todas las revisiones anteriores, así que si publicaste algo de lo que te arrepientes, borrar el Gist es lo que lo elimina — cambiar un ajuste y volver a enviar no lo hace. Los SVGs ya incluidos en tu repositorio de perfil son otra cosa; elimínalos allí.
 
-`vibe-clock export` escribe las estadísticas locales **sin sanear**, con nombres de proyecto e IDs de modelo reales. Existe para análisis local. No subas su salida al repositorio.
+`vibe-clock export` escribe las estadísticas locales **sin sanear**, con nombres de proyecto e IDs de modelo reales. Existe para análisis local. No subas su salida al repositorio. Es el único comando que escribe datos sin sanear en un archivo; `render` no lo es, y por eso sus SVGs son seguros de subir.
+
+## Qué significan los números
+
+**Agent Time (tiempo de agente)** — el número principal de la tarjeta, y el que conviene explicar bien. Es tiempo de reloj durante el cual alguno de tus agentes estaba escribiendo en su registro: los eventos del log se agrupan en tramos (un silencio de más de cinco minutos cierra uno) y luego se toma la **unión** de todas las sesiones, así que dos agentes a la vez cuestan un minuto, no dos.
+
+No es un cronómetro sobre ti. Un registro no puede saber si estabas frente al teclado, así que una ejecución autónoma trabajando de madrugada cuenta igual que una sesión que seguiste entera. Si lanzas trabajos largos sin supervisión, espera un número mayor que tu jornada — ese es el tiempo de la máquina, que es lo que dice la tarjeta. La métrica se llama Agent Time y no "Active Time" precisamente por esto.
+
+La definición anterior era el último evento menos el primero por sesión, sumados. Eso facturaba las pausas para comer, los huecos nocturnos y un proceso de CLI abierto durante quince días como uso, y contaba dos veces los agentes concurrentes; producía 59 horas por día en la máquina del autor.
+
+**Sessions (sesiones)** cuenta lo que cada agente llama sesión, y no es la misma unidad en todos: una sesión de Codex es un archivo de rollout, una de Claude Code es un `sessionId`. Compáralo consigo mismo a lo largo del tiempo, no entre agentes.
+
+**Active Days (días activos)** es el número de días de la ventana en los que algún agente estuvo activo un tiempo distinto de cero.
 
 ## Gráficos
 
@@ -97,6 +121,8 @@ Para dejar de publicar: `vibe-clock unshare` borra el Gist junto con su historia
 vibe-clock render --type card,donut       # escribe los SVGs en el directorio actual
 vibe-clock render --type all
 ```
+
+`render` construye la misma carga útil con lista blanca descrita arriba y dibuja a partir de ella, tanto si recoge datos localmente como si lee un Gist publicado con `--from-json`. Las dos producen la misma imagen, y ninguna puede poner un nombre de proyecto real, una ruta o un ID de modelo crudo en un archivo que estás a punto de subir. También significa que `render` muestra tu ventana **pública** (`privacy.public_days`, 7 días por defecto) y solo los datos que publican tus flags de compartición — para la vista local sin restricciones usa `vibe-clock summary`, o `vibe-clock export` para JSON.
 
 | Gráfico | Archivo | Requiere |
 |-------|------|-------|

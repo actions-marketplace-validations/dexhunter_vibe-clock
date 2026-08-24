@@ -27,12 +27,24 @@ Your agents already write session logs to your disk. vibe-clock reads them, keep
 uv tool install vibe-clock      # or: pipx install vibe-clock, or: pip install vibe-clock
 ```
 
+This README documents **1.5.0 and newer**; `vibe-clock setup` and `vibe-clock workflow` do not exist in earlier releases. Check with `vibe-clock --version`.
+
 ```bash
 vibe-clock summary              # see your stats in the terminal; nothing leaves your machine
+
+cd ~/path/to/your-profile-repo  # setup writes a workflow file into this checkout
 vibe-clock setup                # publish to your profile, when you're ready
 ```
 
-That is the whole thing. `vibe-clock setup` detects your agents, borrows a token from `gh` if you have one, shows you the exact JSON it would publish, creates the Gist, sets the repo secret, writes the workflow file, and installs the daily push. **Every step that changes anything outside your machine asks first**, and any step it cannot do for you it prints instructions for.
+`vibe-clock setup` detects your agents, borrows a token from `gh` if you have one, shows you the exact JSON it would publish, creates the Gist, sets the repo secret, writes the workflow file, and installs the daily push. **Every step that changes anything outside your machine asks first**, and any step it cannot do for you it prints instructions for.
+
+Three things are yours to do afterwards, because they are commits to your own repo and a button in your own browser:
+
+1. Add the `<img>` tags below to your profile `README.md` — `setup` prints the exact block.
+2. Commit and push both that and `.github/workflows/vibe-clock.yml`.
+3. Run the workflow once from the repo's **Actions** tab. After that its cron takes over.
+
+Run `setup` from anywhere else and it prints the workflow YAML for you to save by hand instead of writing it — it will not write files into a directory that is not the repo you named.
 
 <details>
 <summary>Other install methods</summary>
@@ -79,7 +91,7 @@ Nothing leaves your machine until you confirm a preview. This is worth being pre
 - Session IDs, git branches or remotes, hostnames, IP addresses
 - Any agent name that is not one of the four known ones
 
-Two mechanisms enforce this rather than one. The payload is built from an explicit allowlist in [`sanitizer.py`](vibe_clock/sanitizer.py) — a field that is not named there cannot be sent. Then `_validate_no_pii` re-scans the finished JSON and **raises**, aborting the push, if your home directory path or your username appears anywhere in it.
+What enforces it is the allowlist in [`sanitizer.py`](vibe_clock/sanitizer.py): the payload is *built* from a fixed set of fields, so a field not named there cannot be sent, project names are replaced by aliases and model IDs are mapped to a closed list of families before anything is serialized. Behind that sits `_validate_no_pii`, a backstop assertion — it re-checks the handful of fields that carry text derived from your machine, and raises rather than publishing if your home path or username survived the mapping. It is there to turn a future bug into a local crash instead of a public Gist; it is not a second independent filter, and you should read the allowlist, not the assertion, as the guarantee.
 
 Check any of this yourself, before publishing anything:
 
@@ -89,7 +101,19 @@ vibe-clock push --dry-run       # prints the exact JSON, byte for byte, and send
 
 To stop: `vibe-clock unshare` deletes the Gist together with its revision history and disables future updates. Note that a public Gist keeps every past revision, so if you shared something you regret, deleting the Gist is what removes it — changing a setting and pushing again does not.  SVGs already committed to your profile repo are separate; remove them there.
 
-`vibe-clock export` writes the **unsanitized** local stats — real project names and model IDs included. It exists for local analysis. Don't commit its output.
+`vibe-clock export` writes the **unsanitized** local stats — real project names and model IDs included. It exists for local analysis. Don't commit its output. It is the only command that writes unsanitized data to a file; `render` is not, which is why its SVGs are safe to commit.
+
+## What the numbers mean
+
+**Agent Time** — the headline number, and the one worth being careful about. It is wall-clock time during which one of your agents was writing to its log, measured by grouping log events into stretches (a silence longer than five minutes ends one) and then taking the **union** across every session, so two agents running at once cost one minute rather than two.
+
+It is not a stopwatch on you. A log cannot tell whether you were at the keyboard, so an autonomous run grinding away overnight counts exactly like a session you sat through. If you run long unattended jobs, expect a number that is larger than your working day — that is the machine's time, which is what the card says. The metric is deliberately *not* named "Active Time" for this reason.
+
+The old definition was last-event-minus-first-event per session, summed. That billed lunch breaks, overnight gaps and a CLI process left open for a fortnight as usage, and double-counted concurrent agents; it produced 59 hours per day on the author's own machine.
+
+**Sessions** counts what each agent calls a session, which is not the same unit across agents: a Codex session is one rollout file, a Claude Code session is one `sessionId`. Compare it to itself over time, not between agents.
+
+**Active Days** is the number of days in the window on which any agent was active for a non-zero time.
 
 ## Charts
 
@@ -97,6 +121,8 @@ To stop: `vibe-clock unshare` deletes the Gist together with its revision histor
 vibe-clock render --type card,donut       # write SVGs to the current directory
 vibe-clock render --type all
 ```
+
+`render` builds the same allowlisted payload described above and draws from that, whether it collects locally or reads a published Gist with `--from-json`. The two produce the same picture, and neither can put a real project name, a path, or a raw model ID into a file you are about to commit. It also means `render` shows your **public** window (`privacy.public_days`, 7 days by default) and only the data your share flags publish — for the unrestricted local view use `vibe-clock summary`, or `vibe-clock export` for JSON.
 
 | Chart | File | Needs |
 |-------|------|-------|

@@ -72,7 +72,9 @@ vibe-clock push --dry-run
 
 The default payload has exactly ten fields: `schema_version`, `producer_version`, `generated_at` (floored to UTC midnight), `days_covered`, `active_days`, `total_sessions`, `total_minutes`, `active_agents`, `favorite_model`, and `models[]` (family names and session counts).
 
-Never published, regardless of flags: file paths, the home directory, the username, real project or repository names (aliased to `Project A`, `Project B`, …), raw model IDs (reduced to families such as `Claude` / `OpenAI`), prompts, responses, code, session IDs, git data, and hostnames. `sanitizer.py` builds the payload from an allowlist, and `_validate_no_pii` aborts the push if the home path or username appears in the finished JSON.
+Never published, regardless of flags: file paths, the home directory, the username, real project or repository names (aliased to `Project A`, `Project B`, …), raw model IDs (reduced to families such as `Claude` / `OpenAI`), prompts, responses, code, session IDs, git data, and hostnames. `sanitizer.py` builds the payload from an allowlist — that is the guarantee. `_validate_no_pii` sits behind it as a backstop assertion over the fields carrying machine-derived text, so a future bug crashes locally instead of publishing.
+
+`vibe-clock render` draws from that same allowlisted payload whether it collects locally or reads a Gist, so its SVGs are safe to commit. `vibe-clock export` is the one command that writes unsanitized data to a file.
 
 Optional data is off unless requested, one flag each: `--daily-activity`, `--time-patterns`, `--message-counts`, `--token-counts`, `--project-aliases`. Enable only what the user asks for.
 
