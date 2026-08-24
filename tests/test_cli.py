@@ -114,6 +114,8 @@ def test_render_from_json_draws_the_card_from_always_shared_fields(
     assert result.exit_code == 0
     svg = (tmp_path / "vibe-clock-card.svg").read_text()
     assert ">5</text>" in svg  # active days, not a silent 0
+    assert "5.3 hrs" in svg  # 321 minutes of active time
+    assert "Active Agents" not in svg
 
 
 def test_init_detects_gemini_cli(monkeypatch, tmp_path) -> None:

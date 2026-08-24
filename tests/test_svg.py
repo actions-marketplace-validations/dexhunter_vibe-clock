@@ -86,6 +86,16 @@ def test_card_renders_valid_svg() -> None:
     assert "42" in svg  # total sessions
 
 
+def test_card_shows_active_time_instead_of_active_agents() -> None:
+    svg = render_card(_sample_stats(), theme="dark")
+
+    assert "Active Agents" not in svg
+    assert "claude_code, codex" not in svg
+    assert "Active Time" in svg
+    assert "10.0 hrs" in svg  # 600 minutes
+    assert "Active Days" in svg
+
+
 def test_card_light_theme() -> None:
     svg = render_card(_sample_stats(), theme="light")
     assert "#ffffff" in svg

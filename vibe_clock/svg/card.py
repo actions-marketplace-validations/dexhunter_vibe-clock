@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from html import escape
 
+from ..formatting import format_hours
 from ..models import AgentStats
 
 _DARK = {
@@ -27,11 +28,13 @@ _LIGHT = {
 def render_card(stats: AgentStats, theme: str = "dark") -> str:
     c = _DARK if theme == "dark" else _LIGHT
 
+    # Every value here is a field the public payload always carries, so none of
+    # them can silently fall back to a plausible-looking default.
     rows = [
+        ("Active Time", format_hours(stats.total_minutes)),
         ("Sessions", str(stats.total_sessions)),
         ("Active Days", str(stats.active_days)),
         ("Top Model Family", escape(stats.favorite_model) if stats.favorite_model else "—"),
-        ("Active Agents", escape(", ".join(stats.active_agents)) or "—"),
     ]
 
     row_svgs = []
