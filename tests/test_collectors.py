@@ -523,3 +523,117 @@ def test_opencode_uses_message_timestamps_not_the_session_span(
     session = OpenCodeCollector(data_dir=tmp_path).collect()[0]
 
     assert session.duration_minutes == pytest.approx(4.0)  # 2 + 2, not 240
+
+
+def test_opencode_does_not_invent_a_day_from_the_session_record(tmp_path: Path) -> None:
+    """The distrusted `time.created` must not be seeded in among real events.
+
+    It was, one line under a comment explaining that the field is untrustworthy.
+    That injected a zero-length stretch on the day the session record was
+    created, so a session created on Tuesday and worked on Wednesday reported
+    two active days, one of them holding 0.0 minutes.
+    """
+    from datetime import datetime, timezone
+
+    from vibe_clock.aggregator import aggregate
+    from vibe_clock.config import Config
+
+    storage = tmp_path / "storage"
+    (storage / "session" / "proj1").mkdir(parents=True)
+    message_dir = storage / "message" / "ses_split"
+    message_dir.mkdir(parents=True)
+
+    created = int(datetime(2026, 2, 10, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    worked = int(datetime(2026, 2, 11, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    (storage / "session" / "proj1" / "ses_split.json").write_text(
+        json.dumps(
+            {
+                "id": "ses_split",
+                "directory": "/synthetic/project",
+                "time": {"created": created, "updated": worked + 120_000},
+            }
+        )
+    )
+    (message_dir / "msg_0.json").write_text(
+        json.dumps(
+            {
+                "id": "msg_0",
+                "sessionID": "ses_split",
+                "role": "assistant",
+                "modelID": "minimax-m2.1",
+                "time": {"created": worked, "completed": worked + 120_000},
+                "tokens": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
+            }
+        )
+    )
+
+    sessions = OpenCodeCollector(data_dir=tmp_path).collect()
+    stats = aggregate(
+        sessions,
+        Config(default_days=30),
+        end_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+    )
+
+    assert stats.total_minutes == pytest.approx(2.0)
+    assert stats.active_days == 1
+    assert [d.date.isoformat() for d in stats.daily] == ["2026-02-11"]
+
+
+def test_opencode_falls_back_to_a_point_when_no_message_has_a_time(
+    tmp_path: Path,
+) -> None:
+    """No evidence of duration is not evidence of a four-hour session."""
+    storage = tmp_path / "storage"
+    (storage / "session" / "proj1").mkdir(parents=True)
+    (storage / "message" / "ses_bare").mkdir(parents=True)
+    base = 1707560000000
+    (storage / "session" / "proj1" / "ses_bare.json").write_text(
+        json.dumps(
+            {
+                "id": "ses_bare",
+                "directory": "/synthetic/project",
+                "time": {"created": base, "updated": base + 240 * 60_000},
+            }
+        )
+    )
+
+    session = OpenCodeCollector(data_dir=tmp_path).collect()[0]
+
+    assert session.duration_minutes == pytest.approx(0.0)
+
+
+def test_gemini_cli_does_not_invent_a_day_from_the_session_record(
+    tmp_path: Path,
+) -> None:
+    chats = tmp_path / "tmp" / "myproject" / "chats"
+    chats.mkdir(parents=True)
+    (chats / "session-split.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "g-split",
+                "startTime": "2026-02-10T10:00:00Z",
+                "lastUpdated": "2026-02-11T10:02:00Z",
+                "messages": [
+                    {
+                        "type": "gemini",
+                        "timestamp": "2026-02-11T10:00:00Z",
+                        "model": "gemini-3-pro",
+                        "tokens": {"input": 10, "output": 5},
+                    },
+                    {
+                        "type": "gemini",
+                        "timestamp": "2026-02-11T10:02:00Z",
+                        "model": "gemini-3-pro",
+                        "tokens": {"input": 10, "output": 5},
+                    },
+                ],
+            }
+        )
+    )
+
+    session = GeminiCliCollector(data_dir=tmp_path).collect()[0]
+
+    assert session.duration_minutes == pytest.approx(2.0)
+    assert [start.date().isoformat() for start, _ in session.active_intervals] == [
+        "2026-02-11"
+    ]

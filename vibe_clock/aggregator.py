@@ -90,13 +90,19 @@ def aggregate(
     total_messages = 0
 
     for s, in_window in windowed:
-        # The first in-window stretch, not the raw start time, which may sit
-        # outside the window entirely.
-        d = in_window[0][0].date()
+        # Every UTC day this session was actually active on, not just the day it
+        # started: a session that ran past midnight is a session on both days.
+        # Counting only the first day left a day holding 22 hours of activity
+        # blank on the heatmap, because those charts key off the session count.
+        days_active = sorted(minutes_by_utc_day(in_window))
+        d = days_active[0]
 
-        # Daily
+        # Daily. Messages and tokens are per-session totals with no per-day
+        # split available, so they land on the first day rather than being
+        # counted once per day the session touched.
+        for day in days_active:
+            daily_map[day].session_count += 1
         acc = daily_map[d]
-        acc.session_count += 1
         acc.message_count += s.message_count
         _add_tokens(acc.tokens, s.tokens)
 
@@ -131,9 +137,6 @@ def aggregate(
     # agents running at once cost one wall-clock minute, not two. Splitting the
     # union at UTC midnight is what keeps a day from exceeding 1440 minutes.
     daily_minutes = minutes_by_utc_day(all_intervals)
-    for d in daily_minutes:
-        # A day that only holds spill-over minutes is still an active day.
-        daily_map.setdefault(d, _DailyAcc())
 
     # Build hourly distribution (24 slots)
     hourly = [hour_counts.get(h, 0) for h in range(24)]

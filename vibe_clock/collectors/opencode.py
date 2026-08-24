@@ -70,8 +70,11 @@ class OpenCodeCollector(BaseCollector):
         models: dict[str, int] = defaultdict(int)
         # `time.created`/`time.updated` on the session record span from the
         # first message to the last, idle time included. Per-message timestamps
-        # are what actually show when the session was working.
-        timestamps: list[datetime] = [start_time]
+        # are what actually show when the session was working, so the distrusted
+        # session-metadata value must not be seeded in among them: doing so
+        # invented a zero-length stretch on the day the session record was
+        # created, which counted as a whole extra active day.
+        timestamps: list[datetime] = []
 
         msg_session_dir = message_dir / session_id
         if msg_session_dir.exists():
@@ -111,6 +114,12 @@ class OpenCodeCollector(BaseCollector):
         model = "unknown"
         if models:
             model = max(models, key=models.get)  # type: ignore[arg-type]
+
+        if not timestamps:
+            # No message ever recorded a time. The session happened, but there
+            # is no evidence of how long for, so it contributes a single point
+            # rather than the untrusted `created`-to-`updated` span.
+            timestamps = [start_time]
 
         intervals = intervals_from_timestamps(timestamps)
         last_event = intervals[-1][1]

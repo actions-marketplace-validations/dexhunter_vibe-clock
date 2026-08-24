@@ -76,8 +76,11 @@ class GeminiCliCollector(BaseCollector):
         models: dict[str, int] = defaultdict(int)
         message_count = 0
         # `startTime`/`lastUpdated` span the whole conversation including idle
-        # time; per-message timestamps show when it was actually working.
-        timestamps: list[datetime] = [start_time]
+        # time; per-message timestamps show when it was actually working. The
+        # distrusted metadata value is not seeded in among them, because that
+        # invented a zero-length stretch on the session-creation day and counted
+        # it as an extra active day.
+        timestamps: list[datetime] = []
 
         for msg in data.get("messages", []):
             msg_ts = _parse_timestamp(msg.get("timestamp"))
@@ -100,6 +103,11 @@ class GeminiCliCollector(BaseCollector):
         model = "unknown"
         if models:
             model = max(models, key=models.get)  # type: ignore[arg-type]
+
+        if not timestamps:
+            # No message carried a usable timestamp: record that the session
+            # happened without billing the untrusted conversation span.
+            timestamps = [start_time]
 
         intervals = intervals_from_timestamps(timestamps)
         last_event = intervals[-1][1]

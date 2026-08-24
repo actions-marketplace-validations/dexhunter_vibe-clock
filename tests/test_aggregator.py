@@ -341,3 +341,120 @@ def test_public_payload_optional_fields_are_explicit() -> None:
     assert "total_minutes" not in payload["models"][0]
     assert "total_minutes" not in payload["projects"][0]
     assert "secret-project" not in json.dumps(payload)
+
+
+def test_exclude_projects_accepts_a_plain_substring() -> None:
+    """The documented form used to exclude nothing.
+
+    Matching was glob-only and anchored, so `exclude_projects = ["AcmeCorp"]` —
+    exactly what the config comment told people to write — matched only a
+    project named precisely `AcmeCorp` and silently published the rest. This is
+    the only escape hatch for keeping a client out of your public stats, so
+    silence is the worst possible answer.
+    """
+    sessions = [
+        _make_session(sid="s1", project="/work/clients/AcmeCorp/nda-project"),
+        _make_session(sid="s2", project="/work/public-project"),
+    ]
+    config = Config(default_days=30)
+    config.privacy.exclude_projects = ["AcmeCorp"]
+
+    assert aggregate(sessions, config, end_at=_WINDOW_END).total_sessions == 1
+
+
+def test_exclude_projects_ignores_case() -> None:
+    sessions = [_make_session(sid="s1", project="/work/ACMECORP-PRIVATE-REPO")]
+    config = Config(default_days=30)
+    config.privacy.exclude_projects = ["acmecorp"]
+
+    assert aggregate(sessions, config, end_at=_WINDOW_END).total_sessions == 0
+
+
+def test_exclude_projects_still_accepts_globs() -> None:
+    sessions = [
+        _make_session(sid="s1", project="/home/user/secret-project"),
+        _make_session(sid="s2", project="/home/user/public-project"),
+    ]
+    config = Config(default_days=30)
+    config.privacy.exclude_projects = ["*/secret-*"]
+
+    assert aggregate(sessions, config, end_at=_WINDOW_END).total_sessions == 1
+
+
+def test_a_session_running_past_midnight_counts_on_both_days() -> None:
+    """A day full of activity must not show up blank.
+
+    `daily[].session_count` used to be credited only to the day a session first
+    became active, while its minutes were split across midnight. The heatmap and
+    the weekly chart key off the session count, so a day holding hours of
+    spill-over work rendered as an empty cell.
+    """
+    sessions = [
+        _make_session(
+            sid="overnight",
+            start="2026-02-10T23:00:00Z",
+            end="2026-02-11T02:00:00Z",
+        )
+    ]
+    config = Config(default_days=30)
+
+    daily = {d.date.isoformat(): d for d in aggregate(sessions, config, end_at=_WINDOW_END).daily}
+
+    assert daily["2026-02-10"].session_count == 1
+    assert daily["2026-02-11"].session_count == 1
+    assert daily["2026-02-10"].total_minutes == 60.0
+    assert daily["2026-02-11"].total_minutes == 120.0
+    # Messages have no per-day split, so they are not counted twice.
+    assert daily["2026-02-10"].message_count == 10
+    assert daily["2026-02-11"].message_count == 0
+
+
+def test_no_day_has_minutes_without_sessions_or_sessions_without_minutes() -> None:
+    sessions = [
+        _make_session(sid="a", start="2026-02-10T23:30:00Z", end="2026-02-11T00:30:00Z"),
+        _make_session(sid="b", start="2026-02-13T09:00:00Z", end="2026-02-13T09:45:00Z"),
+    ]
+    stats = aggregate(sessions, Config(default_days=30), end_at=_WINDOW_END)
+
+    for day in stats.daily:
+        assert (day.total_minutes > 0) == (day.session_count > 0), day
+    assert stats.active_days == len(stats.daily)
+
+
+def test_pii_guard_does_not_fire_on_the_tools_own_constants(monkeypatch) -> None:
+    """A user whose Unix login is `code` or `claude` could not publish at all.
+
+    The guard scanned the whole serialized payload for the login name with
+    non-letter boundaries, and `active_agents` carries the constant
+    `claude_code` — whose boundaries are underscores. `push`, `share` and
+    `setup` all died with an unhandled traceback blaming a leak that had not
+    happened, with no documented workaround.
+    """
+    from vibe_clock import sanitizer
+
+    sessions = [_make_session(sid="s1", agent="claude_code")]
+    stats = aggregate(sessions, Config(default_days=30), end_at=_WINDOW_END)
+
+    for login in ("code", "claude", "dex"):
+        monkeypatch.setattr(sanitizer, "_USERNAME", login)
+        payload = sanitizer.public_payload(stats, Config(default_days=30))
+        assert payload["active_agents"] == ["claude_code"]
+
+
+def test_pii_guard_still_fires_when_a_raw_name_reaches_the_payload(monkeypatch) -> None:
+    """It is a backstop against a future bug, so it must still catch one."""
+    import pytest
+
+    from vibe_clock import sanitizer
+
+    monkeypatch.setattr(sanitizer, "_USERNAME", "dex")
+    monkeypatch.setattr(sanitizer, "_model_family", lambda model: model)
+
+    stats = aggregate(
+        [_make_session(sid="s1", model="private-dex-model")],
+        Config(default_days=30),
+        end_at=_WINDOW_END,
+    )
+
+    with pytest.raises(ValueError, match="username"):
+        sanitizer.public_payload(stats, Config(default_days=30))
