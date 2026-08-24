@@ -127,7 +127,7 @@ def test_init_detects_gemini_cli(monkeypatch, tmp_path) -> None:
     config.paths.gemini_cli.mkdir()
     saves = []
 
-    monkeypatch.setattr("vibe_clock.cli.Config", lambda: config)
+    monkeypatch.setattr("vibe_clock.cli.load_config", lambda: config)
     monkeypatch.setattr("vibe_clock.cli.click.prompt", lambda *args, **kwargs: "")
     monkeypatch.setattr("vibe_clock.cli.save_config", lambda current: saves.append(current))
 

@@ -22,7 +22,7 @@ from . import __version__
 from .aggregator import aggregate
 from .collectors import COLLECTOR_MAP, get_collectors
 from .formatting import format_bar, format_hourly_chart, format_hours, format_number
-from .config import Config, load_config, save_config
+from .config import CONFIG_PATH, Config, load_config, save_config
 from .models import AgentStats
 from .payload import (
     DAILY_ACTIVITY,
@@ -43,8 +43,19 @@ from .svg.heatmap import render_heatmap
 from .svg.hourly import render_hourly
 from .svg.token_bars import render_token_bars
 from .svg.weekly import render_weekly
+from . import gh
+from .workflow import (
+    DEFAULT_CHART_TYPES,
+    WORKFLOW_PATH,
+    readme_snippet,
+    workflow_yaml,
+)
 
 console = Console()
+
+# Every renderer branches on `theme == "dark"`, so an unrecognised value used to
+# render light without saying so.
+THEMES = ("dark", "light")
 
 # filename, renderer, and the shared data the chart cannot be drawn without.
 SVG_RENDERERS: dict[str, tuple[str, object, tuple[Requirement, ...]]] = {
@@ -65,13 +76,36 @@ def cli() -> None:
 
 
 @cli.command()
-def init() -> None:
-    """Interactive setup — create config file."""
+@click.option("--reset", is_flag=True, help="Discard the existing config and start from defaults.")
+def init(reset: bool) -> None:
+    """Create or refresh the config file (`setup` does the whole onboarding)."""
     console.print("[bold]vibe-clock init[/bold]")
 
-    config = Config()
+    # Start from what is already configured. Constructing a fresh Config() here
+    # used to silently wipe gist_id, profile_repo, and every privacy and
+    # schedule setting — so re-running init, the most natural thing a confused
+    # user does, permanently disabled their share while leaving the scheduled
+    # push installed and failing.
+    config = Config() if reset else load_config()
 
-    # Auto-detect available agents
+    config.enabled_agents = _detect_agents(config)
+
+    prompt = "\nGitHub token (Classic PAT with 'gist' scope, or press Enter to skip)"
+    if config.github.token:
+        prompt = "\nGitHub token (press Enter to keep the one already configured)"
+    token = click.prompt(prompt, default="", show_default=False, hide_input=True)
+    if token:
+        config.github.token = token
+
+    save_config(config)
+    from .config import CONFIG_PATH
+    console.print(f"\n[green]Config saved to {CONFIG_PATH}[/green]")
+    if not config.privacy.public_sharing_enabled:
+        console.print("[dim]Nothing is published yet — run `vibe-clock setup` to finish.[/dim]")
+
+
+def _detect_agents(config: Config) -> list[str]:
+    """Report which agents have a data directory, and return their names."""
     available = []
     for name in COLLECTOR_MAP:
         path = getattr(config.paths, name, None)
@@ -80,22 +114,7 @@ def init() -> None:
             console.print(f"  [green]✓[/green] Found {name} at {path}")
         elif path:
             console.print(f"  [dim]✗ {name} not found at {path}[/dim]")
-
-    config.enabled_agents = available
-
-    # Ask for GitHub token
-    token = click.prompt(
-        "\nGitHub token (PAT with 'gist' scope, or press Enter to skip)",
-        default="",
-        show_default=False,
-        hide_input=True,
-    )
-    if token:
-        config.github.token = token
-
-    save_config(config)
-    from .config import CONFIG_PATH
-    console.print(f"\n[green]Config saved to {CONFIG_PATH}[/green]")
+    return available
 
 
 @cli.command()
@@ -295,17 +314,29 @@ def status(days: int | None) -> None:
 )
 @click.option("--output", "-o", "output_dir", default=".", help="Output directory for SVG files.")
 @click.option("--from-json", "json_path", default=None, help="Generate from exported JSON instead of collecting.")
-@click.option("--theme", default=None, help="Theme: dark or light.")
+@click.option("--theme", default=None, type=click.Choice(THEMES), help="Theme (default: from config).")
 def render(chart_type: str, output_dir: str, json_path: str | None, theme: str | None) -> None:
     """Generate SVG visualizations."""
     config = load_config()
     th = theme or config.theme
+    if th not in THEMES:
+        raise click.ClickException(
+            f"unknown theme {th!r} in {CONFIG_PATH}. Valid themes: {', '.join(THEMES)}."
+        )
 
     types = (
         list(SVG_RENDERERS.keys())
         if chart_type == "all"
-        else [t.strip() for t in chart_type.split(",")]
+        else [t.strip() for t in chart_type.split(",") if t.strip()]
     )
+    # A typo in --type used to print a red line and exit 0, so CI stayed green
+    # while a chart the profile links to was never written.
+    unknown = [t for t in types if t not in SVG_RENDERERS]
+    if unknown:
+        raise click.ClickException(
+            f"unknown chart type(s): {', '.join(unknown)}. "
+            f"Valid types: {', '.join(SVG_RENDERERS)}, all."
+        )
 
     if json_path:
         try:
@@ -329,9 +360,6 @@ def render(chart_type: str, output_dir: str, json_path: str | None, theme: str |
     out.mkdir(parents=True, exist_ok=True)
 
     for t in types:
-        if t not in SVG_RENDERERS:
-            console.print(f"[red]Unknown chart type: {t}[/red]")
-            continue
         filename, renderer, _ = SVG_RENDERERS[t]
         svg = renderer(stats, theme=th)
         path = out / filename
@@ -379,23 +407,36 @@ def export(output: str, days: int | None) -> None:
     console.print(f"[green]Exported to {output}[/green]")
 
 
-def _trigger_render(client: httpx.Client, profile_repo: str) -> None:
-    """Trigger the vibe-clock workflow on the profile repo via workflow_dispatch."""
+def _trigger_render(client: httpx.Client, profile_repo: str, workflow_file: str) -> None:
+    """Ask the profile repo to re-render now, instead of waiting for its cron."""
     repo_resp = client.get(f"https://api.github.com/repos/{profile_repo}")
     if repo_resp.status_code != 200:
-        console.print(f"[yellow]Could not find profile repo {profile_repo}[/yellow]")
+        console.print(
+            f"[yellow]Could not read {profile_repo} ({repo_resp.status_code}). "
+            "Check `github.profile_repo` in your config, or that your token has "
+            "`repo` scope.[/yellow]"
+        )
         return
 
     default_branch = repo_resp.json().get("default_branch", "main")
     dispatch_resp = client.post(
-        f"https://api.github.com/repos/{profile_repo}/actions/workflows/vibe-clock.yml/dispatches",
+        f"https://api.github.com/repos/{profile_repo}/actions/workflows/{workflow_file}/dispatches",
         json={"ref": default_branch},
     )
 
     if dispatch_resp.status_code == 204:
-        console.print(f"[green]Triggered render workflow on {profile_repo}[/green]")
-    else:
-        console.print(f"[yellow]Could not trigger workflow ({dispatch_resp.status_code})[/yellow]")
+        console.print(f"[green]Triggered {workflow_file} on {profile_repo}[/green]")
+        return
+
+    # The two real causes, named, instead of a bare status code. Neither is
+    # fatal: the workflow's own cron still renders the Gist we just updated.
+    console.print(
+        f"[yellow]Could not trigger {workflow_file} on {profile_repo} "
+        f"({dispatch_resp.status_code}). Either the token lacks `repo` scope "
+        "(dispatching needs it; `gist` alone is not enough), or the workflow is "
+        f"not named {workflow_file} — set `github.workflow_file` to its real name. "
+        "The scheduled run will still pick this push up.[/yellow]"
+    )
 
 
 def _collect_public_stats(config: Config) -> AgentStats:
@@ -470,15 +511,12 @@ def _publish_public_stats(config: Config, stats: AgentStats) -> None:
 
     console.print(f"[dim]{result.get('html_url', '')}[/dim]")
 
-    # Trigger profile repo workflow to render SVGs
-    profile_repo = config.github.profile_repo
-    if not profile_repo:
-        owner = result.get("owner", {}).get("login", "")
-        if owner:
-            profile_repo = f"{owner}/{owner}"
-
-    if profile_repo:
-        _trigger_render(client, profile_repo)
+    # Only dispatch when the user asked for it. This used to guess the repo as
+    # <owner>/<owner> and always attempt a dispatch, which needs `repo` scope —
+    # so everyone following the docs (which ask only for `gist`) saw a warning
+    # on every single push, forever, about a step they never requested.
+    if config.github.trigger_workflow and config.github.profile_repo:
+        _trigger_render(client, config.github.profile_repo, config.github.workflow_file)
 
     client.close()
 
@@ -507,13 +545,24 @@ def push(dry_run: bool, days: int | None) -> None:
     _publish_public_stats(config, stats)
 
 
+def _share_options(command):
+    """The five opt-in data flags, shared by `share` and `setup`."""
+    for option in reversed(
+        [
+            click.option("--daily-activity/--no-daily-activity", default=False),
+            click.option("--message-counts/--no-message-counts", default=False),
+            click.option("--token-counts/--no-token-counts", default=False),
+            click.option("--time-patterns/--no-time-patterns", default=False),
+            click.option("--project-aliases/--no-project-aliases", default=False),
+        ]
+    ):
+        command = option(command)
+    return command
+
+
 @cli.command()
 @click.option("--days", default=7, type=click.IntRange(1, 365), show_default=True)
-@click.option("--daily-activity/--no-daily-activity", default=False)
-@click.option("--message-counts/--no-message-counts", default=False)
-@click.option("--token-counts/--no-token-counts", default=False)
-@click.option("--time-patterns/--no-time-patterns", default=False)
-@click.option("--project-aliases/--no-project-aliases", default=False)
+@_share_options
 @click.option("--yes", "assume_yes", is_flag=True, help="Skip the confirmation prompt.")
 def share(
     days: int,
@@ -603,20 +652,31 @@ def unshare(assume_yes: bool) -> None:
 @click.option("--force", is_flag=True, help="Overwrite existing schedule.")
 def schedule(interval: str, run_time: str | None, force: bool) -> None:
     """Schedule automatic vibe-clock push."""
-    if run_time is None:
-        utc_midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        run_time = utc_midnight.astimezone().strftime("%H:%M")
-
-    from .scheduler import get_scheduler, resolve_binary
-
     config = load_config()
 
     if not config.github.token:
-        console.print("[red]No GitHub token configured. Run 'vibe-clock init' first.[/red]")
+        console.print("[red]No GitHub token configured. Run 'vibe-clock setup' first.[/red]")
         sys.exit(1)
     if not config.privacy.public_sharing_enabled:
         console.print("[yellow]Run 'vibe-clock share' before scheduling public updates.[/yellow]")
         return
+
+    _install_schedule(config, interval, run_time, force=force)
+
+
+def _install_schedule(
+    config: Config, interval: str, run_time: str | None, *, force: bool
+) -> None:
+    """Install the periodic local push on whichever backend this OS provides."""
+    from .scheduler import get_scheduler, resolve_binary
+
+    if run_time is None:
+        # Default to the local wall-clock time of 00:00 UTC, so the push lands
+        # just before the workflow's own 00:30 UTC render.
+        utc_midnight = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        run_time = utc_midnight.astimezone().strftime("%H:%M")
 
     try:
         datetime.strptime(run_time, "%H:%M")
@@ -624,7 +684,17 @@ def schedule(interval: str, run_time: str | None, force: bool) -> None:
         console.print("[red]Invalid time format. Use HH:MM (e.g. 08:00, 23:30).[/red]")
         sys.exit(1)
 
-    scheduler = get_scheduler()
+    try:
+        scheduler = get_scheduler()
+    except RuntimeError as exc:
+        # Windows has no backend. Say so, and say what to do instead, rather
+        # than dying on an unhandled traceback.
+        console.print(f"[yellow]{exc}[/yellow]")
+        console.print(
+            "[dim]On Windows, run vibe-clock inside WSL, or create a Task "
+            "Scheduler task that runs `vibe-clock push` daily.[/dim]"
+        )
+        return
 
     if scheduler.is_scheduled() and not force:
         console.print(
@@ -646,8 +716,18 @@ def schedule(interval: str, run_time: str | None, force: bool) -> None:
     save_config(config)
 
     time_msg = "" if interval == "hourly" else f" at {run_time}"
-    console.print(f"[green]Scheduled {interval} push{time_msg} via {scheduler.backend_name}.[/green]")
-    console.print(f"[dim]Verify: {verify_cmd}[/dim]")
+    console.print(
+        f"  [green]✓[/green] Scheduled {interval} push{time_msg} via {scheduler.backend_name}"
+    )
+    console.print(f"  [dim]Verify: {verify_cmd}[/dim]")
+    if scheduler.backend_name == "systemd":
+        # A user timer is suspended when the user logs out unless lingering is
+        # on, which silently freezes the profile on a headless box.
+        console.print(
+            "  [dim]If this machine has no permanent login session, enable "
+            "lingering so the timer runs anyway: "
+            "sudo loginctl enable-linger $USER[/dim]"
+        )
 
 
 @cli.command()
@@ -669,3 +749,287 @@ def unschedule() -> None:
     save_config(config)
 
     console.print(f"[green]Unscheduled vibe-clock push ({scheduler.backend_name}).[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Onboarding
+# ---------------------------------------------------------------------------
+
+
+def _confirm(question: str, assume_yes: bool, *, default: bool = True) -> bool:
+    """Ask before every remote or system mutation. `--yes` answers all of them."""
+    if assume_yes:
+        console.print(f"  [dim]{question} — yes (--yes)[/dim]")
+        return True
+    return click.confirm(question, default=default)
+
+
+def _step(number: int, title: str) -> None:
+    console.print(f"\n[bold cyan]{number}.[/bold cyan] [bold]{title}[/bold]")
+
+
+def _resolve_token(config: Config, assume_yes: bool) -> str:
+    """Find a GitHub token, preferring one `gh` already holds."""
+    if config.github.token:
+        console.print("  [green]✓[/green] Using the token already in your config")
+        return config.github.token
+
+    if gh.is_available():
+        scopes = gh.scopes()
+        token = gh.token()
+        if token:
+            if scopes and "gist" not in scopes:
+                console.print(
+                    "  [yellow]![/yellow] Your `gh` token has scopes "
+                    f"{sorted(scopes)} but not `gist`, which is required to "
+                    "create the Gist. Run: gh auth refresh -s gist"
+                )
+            else:
+                console.print(
+                    "  [green]✓[/green] Borrowed a token from `gh auth` — no PAT to mint.\n"
+                    f"  [dim]It is stored in {CONFIG_PATH} (0600), because the "
+                    "scheduled push runs without your shell's PATH and cannot "
+                    "call `gh` itself.[/dim]"
+                )
+                return token
+
+    console.print(
+        "  No `gh` login found. Create a [bold]Classic[/bold] token at\n"
+        "  [link]https://github.com/settings/tokens/new?scopes=gist&description=vibe-clock[/link]\n"
+        "  and tick [bold]gist[/bold]. Fine-grained tokens cannot write Gists."
+    )
+    if assume_yes:
+        raise click.ClickException(
+            "no GitHub token available and --yes cannot prompt for one. "
+            "Set GITHUB_TOKEN, or run `gh auth login -s gist`."
+        )
+    token = click.prompt("  Paste the token", default="", show_default=False, hide_input=True)
+    if not token:
+        raise click.ClickException("a GitHub token is required to publish the Gist")
+    return token
+
+
+def _resolve_profile_repo(config: Config, given: str | None, assume_yes: bool) -> str:
+    """Decide which repo renders the SVGs. Never guessed silently."""
+    candidate = given or config.github.profile_repo
+    if not candidate:
+        login = gh.login()
+        if login:
+            candidate = f"{login}/{login}"
+            console.print(f"  [dim]`gh` says you are {login}[/dim]")
+    if not candidate and not assume_yes:
+        candidate = click.prompt("  Profile repo (owner/repo)", default="", show_default=False)
+    if not candidate:
+        raise click.ClickException(
+            "could not determine your profile repo. Pass --profile-repo owner/repo."
+        )
+    if candidate.count("/") != 1 or not all(candidate.split("/")):
+        raise click.ClickException(f"--profile-repo must look like owner/repo, got {candidate!r}")
+    if not assume_yes and given is None:
+        candidate = click.prompt("  Profile repo (owner/repo)", default=candidate)
+    return candidate
+
+
+def _requested_charts(charts: str, privacy) -> list[str]:
+    """Validate chart names, and that the data each one needs is being shared."""
+    names = [t.strip() for t in charts.split(",") if t.strip()]
+    if not names:
+        raise click.ClickException("--charts must name at least one chart")
+    unknown = [n for n in names if n not in SVG_RENDERERS]
+    if unknown:
+        raise click.ClickException(
+            f"unknown chart type(s): {', '.join(unknown)}. Valid: {', '.join(SVG_RENDERERS)}."
+        )
+    # Catching this now beats letting the workflow fail on its first run — or,
+    # worse, drawing an empty chart from data that was never shared.
+    problems = [
+        f"chart '{n}' needs {req.label}; add {req.flag}"
+        for n in names
+        for req in SVG_RENDERERS[n][2]
+        if not getattr(privacy, req.privacy_attr)
+    ]
+    if problems:
+        raise click.ClickException(
+            "\n".join(problems) + "\n(or drop those charts from --charts)"
+        )
+    return names
+
+
+def _git_slug(path: Path) -> str | None:
+    """The owner/repo of the git checkout at `path`, if it is one."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip().removesuffix(".git")
+    if ":" in url and "//" not in url:  # git@github.com:owner/repo
+        url = url.split(":", 1)[1]
+    parts = [p for p in url.split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else None
+
+
+def _install_workflow(profile_repo: str, charts: str, assume_yes: bool) -> None:
+    """Write the workflow into the profile repo checkout, or print it."""
+    yaml = workflow_yaml(chart_types=charts)
+    cwd = Path.cwd()
+    if _git_slug(cwd) == profile_repo:
+        target = cwd / WORKFLOW_PATH
+        action = "Overwrite" if target.exists() else "Write"
+        if _confirm(f"  {action} {target}?", assume_yes):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(yaml)
+            console.print(f"  [green]✓[/green] {target} — commit and push it")
+            return
+    console.print(
+        f"  Create [bold]{WORKFLOW_PATH}[/bold] in {profile_repo} with:\n"
+        "  [dim](or run `vibe-clock workflow` from inside that checkout)[/dim]"
+    )
+    console.print(yaml)
+
+
+@cli.command()
+@click.option("--profile-repo", default=None, help="owner/repo whose Actions render your SVGs.")
+@click.option("--days", default=7, type=click.IntRange(1, 365), show_default=True)
+@_share_options
+@click.option(
+    "--charts",
+    default=DEFAULT_CHART_TYPES,
+    show_default=True,
+    help="Charts the workflow should generate.",
+)
+@click.option("--no-schedule", is_flag=True, help="Skip installing the local scheduled push.")
+@click.option("--yes", "assume_yes", is_flag=True, help="Accept every prompt (non-interactive).")
+def setup(
+    profile_repo: str | None,
+    days: int,
+    daily_activity: bool,
+    message_counts: bool,
+    token_counts: bool,
+    time_patterns: bool,
+    project_aliases: bool,
+    charts: str,
+    no_schedule: bool,
+    assume_yes: bool,
+) -> None:
+    """Set up everything: detect agents, publish the Gist, wire up Actions.
+
+    Replaces a thirteen-step manual walkthrough. Every step that changes
+    something outside this machine asks first.
+    """
+    config = load_config()
+
+    _step(1, "Detect agents")
+    config.enabled_agents = _detect_agents(config)
+    if not config.enabled_agents:
+        raise click.ClickException(
+            "no agent data directories found. Use one of Claude Code, Codex, "
+            "Gemini CLI, or OpenCode first, or set [paths] in your config."
+        )
+
+    _step(2, "GitHub credentials")
+    config.github.token = _resolve_token(config, assume_yes)
+
+    _step(3, "Profile repo")
+    config.github.profile_repo = _resolve_profile_repo(config, profile_repo, assume_yes)
+    console.print(f"  [green]✓[/green] {config.github.profile_repo}")
+
+    _step(4, "Choose what to publish")
+    config.privacy.public_days = days
+    config.privacy.share_daily_activity = daily_activity
+    config.privacy.share_message_counts = message_counts
+    config.privacy.share_token_counts = token_counts
+    config.privacy.share_time_patterns = time_patterns
+    config.privacy.share_project_aliases = project_aliases
+    _requested_charts(charts, config.privacy)
+
+    if config.github.gist_id and not config.privacy.public_sharing_enabled:
+        raise click.ClickException(
+            "a Gist from an older release is configured. Run `vibe-clock unshare` "
+            "to delete its revision history first, then run setup again."
+        )
+
+    _step(5, "Review the exact public payload")
+    stats = _collect_public_stats(config)
+    console.print(preview(stats, config))
+    if not _confirm("  Publish this to a public GitHub Gist?", assume_yes):
+        console.print("[yellow]Nothing published. Config left unchanged.[/yellow]")
+        return
+
+    config.privacy.public_sharing_enabled = True
+    _publish_public_stats(config, stats)
+    save_config(config)
+
+    _step(6, "Tell your profile repo the Gist ID")
+    gist_id = config.github.gist_id
+    if gh.is_available() and _confirm(
+        f"  Set secret VIBE_CLOCK_GIST_ID on {config.github.profile_repo} via gh?", assume_yes
+    ):
+        ok, message = gh.set_secret(config.github.profile_repo, "VIBE_CLOCK_GIST_ID", gist_id)
+        console.print(
+            f"  [green]✓[/green] {message}" if ok else f"  [yellow]![/yellow] {message}"
+        )
+        if not ok:
+            _print_manual_secret(config.github.profile_repo, gist_id)
+    else:
+        _print_manual_secret(config.github.profile_repo, gist_id)
+
+    _step(7, "Install the render workflow")
+    _install_workflow(config.github.profile_repo, charts, assume_yes)
+
+    _step(8, "Keep the Gist fresh")
+    if no_schedule:
+        console.print("  [dim]Skipped. Run `vibe-clock schedule` when you want it.[/dim]")
+    elif _confirm("  Install a daily local `vibe-clock push`?", assume_yes):
+        _install_schedule(config, "daily", None, force=True)
+    else:
+        console.print(
+            "  [dim]Without it the Gist never updates and your profile freezes. "
+            "Run `vibe-clock schedule` later.[/dim]"
+        )
+
+    _step(9, "Add the charts to your README")
+    console.print(readme_snippet(charts))
+    console.print(
+        f"\n[green]Done.[/green] Commit {WORKFLOW_PATH} and your README to "
+        f"{config.github.profile_repo}, then run the workflow once from its Actions tab."
+    )
+
+
+def _print_manual_secret(profile_repo: str, gist_id: str) -> None:
+    console.print(
+        f"  Add a repository secret to {profile_repo} by hand:\n"
+        f"  [link]https://github.com/{profile_repo}/settings/secrets/actions/new[/link]\n"
+        f"    Name:  VIBE_CLOCK_GIST_ID\n"
+        f"    Value: {gist_id}"
+    )
+
+
+@cli.command()
+@click.option(
+    "--charts",
+    default=DEFAULT_CHART_TYPES,
+    show_default=True,
+    help="Charts the workflow should generate.",
+)
+@click.option("--write", is_flag=True, help=f"Write {WORKFLOW_PATH} instead of printing it.")
+def workflow(charts: str, write: bool) -> None:
+    """Print the GitHub Actions workflow to install in your profile repo."""
+    _requested_charts(charts, load_config().privacy)
+    yaml = workflow_yaml(chart_types=charts)
+    if not write:
+        click.echo(yaml, nl=False)
+        return
+    target = Path(WORKFLOW_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml)
+    console.print(f"[green]Wrote {target}[/green] — commit it to your profile repo.")

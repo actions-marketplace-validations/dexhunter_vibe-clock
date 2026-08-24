@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from .workflow import WORKFLOW_FILENAME
+
 if sys.version_info >= (3, 11):
     import tomllib
 else:
@@ -30,7 +32,17 @@ class PathsConfig(BaseModel):
 class GithubConfig(BaseModel):
     token: str = ""
     gist_id: str = ""
+    # "owner/repo" that renders your SVGs. Empty means "not configured"; it is
+    # never guessed, because guessing produced a confusing 404 warning on every
+    # push for anyone whose profile repo is not <login>/<login>.
     profile_repo: str = ""
+    # Workflow file to dispatch, relative to .github/workflows/. Configurable
+    # because the name was previously hardcoded, so any other name 404'd.
+    workflow_file: str = WORKFLOW_FILENAME
+    # Dispatching a workflow needs a token with `repo` scope, which is far
+    # broader than the `gist` scope everything else needs. Off by default: the
+    # workflow's own cron covers the common case with no extra permission.
+    trigger_workflow: bool = False
 
 
 class PrivacyConfig(BaseModel):
@@ -122,6 +134,8 @@ def save_config(config: Config) -> None:
         f'token = "{config.github.token}"',
         f'gist_id = "{config.github.gist_id}"',
         f'profile_repo = "{config.github.profile_repo}"',
+        f'workflow_file = "{config.github.workflow_file}"',
+        f'trigger_workflow = {"true" if config.github.trigger_workflow else "false"}',
         "",
         "[agents]",
         f'enabled = {config.enabled_agents}',

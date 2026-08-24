@@ -49,8 +49,15 @@ runs:
         GIST_ID: ${{ inputs.gist_id }}
         REPO_OWNER: ${{ github.repository_owner }}
       run: |
-        curl -sf "https://gist.githubusercontent.com/${REPO_OWNER}/${GIST_ID}/raw/vibe-clock-data.json" \
-          -o /tmp/vibe-clock-data.json
+        if [ -z "${GIST_ID}" ]; then
+          echo "::error::gist_id is empty. Set the VIBE_CLOCK_GIST_ID secret on this repository (vibe-clock setup does this for you)."
+          exit 1
+        fi
+        if ! curl -sf "https://gist.githubusercontent.com/${REPO_OWNER}/${GIST_ID}/raw/vibe-clock-data.json" \
+          -o /tmp/vibe-clock-data.json; then
+          echo "::error::Could not fetch vibe-clock-data.json from gist ${GIST_ID} owned by ${REPO_OWNER}. Check the gist ID, that the gist is public, and that it was created by ${REPO_OWNER}."
+          exit 1
+        fi
 
     - name: Generate SVGs
       shell: bash
@@ -77,5 +84,14 @@ runs:
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git add "${OUTPUT_DIR}"
-        git diff --staged --quiet || git commit -m "${COMMIT_MSG}"
-        git push
+        git diff --staged --quiet && { echo "No SVG changes to commit."; exit 0; }
+        git commit -m "${COMMIT_MSG}"
+        # A bare `git push` here 403s on any repo that has not granted write
+        # access, which is every repo by default since GITHUB_TOKEN went
+        # read-only. Name the fix instead of printing a raw permission error.
+        git push || {
+          echo "::error::git push failed. Add this to your workflow, above \`jobs:\`:"
+          echo "::error::  permissions:"
+          echo "::error::    contents: write"
+          exit 1
+        }

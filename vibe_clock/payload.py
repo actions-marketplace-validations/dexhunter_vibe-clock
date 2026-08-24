@@ -113,6 +113,9 @@ class Requirement:
     key: str
     label: str
     flag: str
+    # The PrivacyConfig attribute the flag sets, so `setup` can refuse a chart
+    # whose data the chosen share flags would never publish.
+    privacy_attr: str
 
     def satisfied_by(self, payload: PublicPayload) -> bool:
         if self.key == "model_tokens":
@@ -124,10 +127,18 @@ class Requirement:
         return getattr(payload, self.key) is not None
 
 
-DAILY_ACTIVITY = Requirement("daily", "daily activity", "--daily-activity")
-TIME_PATTERNS = Requirement("hourly", "hourly time patterns", "--time-patterns")
-PROJECT_ALIASES = Requirement("projects", "project aliases", "--project-aliases")
-TOKEN_COUNTS = Requirement("model_tokens", "token counts", "--token-counts")
+DAILY_ACTIVITY = Requirement(
+    "daily", "daily activity", "--daily-activity", "share_daily_activity"
+)
+TIME_PATTERNS = Requirement(
+    "hourly", "hourly time patterns", "--time-patterns", "share_time_patterns"
+)
+PROJECT_ALIASES = Requirement(
+    "projects", "project aliases", "--project-aliases", "share_project_aliases"
+)
+TOKEN_COUNTS = Requirement(
+    "model_tokens", "token counts", "--token-counts", "share_token_counts"
+)
 
 
 def load_public_payload(text: str, *, reader_version: str = __version__) -> PublicPayload:
