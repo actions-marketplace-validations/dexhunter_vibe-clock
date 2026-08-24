@@ -143,7 +143,7 @@ def _print_overview(stats: "AgentStats") -> None:
     t.add_column(style="cyan")
     t.add_column(style="bold white")
     t.add_row(
-        "⏱  Total Time",
+        "⏱  Active Time",
         format_hours(stats.total_minutes),
         "🤖 Favorite Model",
         stats.favorite_model or "—",
@@ -157,8 +157,8 @@ def _print_overview(stats: "AgentStats") -> None:
     t.add_row(
         "📨 Messages",
         format_number(stats.total_messages),
-        "🔥 Longest Session",
-        f"{stats.longest_session_minutes:.0f} min",
+        "🔥 Longest Stretch",
+        f"{stats.longest_stretch_minutes:.0f} min",
     )
     t.add_row(
         "🔢 Tokens",

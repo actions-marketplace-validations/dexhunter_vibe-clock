@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from vibe_clock.collectors.claude_code import ClaudeCodeCollector
 from vibe_clock.collectors.codex import CodexCollector
 from vibe_clock.collectors.gemini_cli import GeminiCliCollector
@@ -87,6 +89,40 @@ def test_claude_code_collector(tmp_path: Path) -> None:
     assert s.project == "my-project"
 
 
+def test_claude_code_session_excludes_idle_gaps(tmp_path: Path) -> None:
+    """An overnight break inside one conversation is not time spent."""
+    project_dir = tmp_path / "projects" / "my-project"
+    project_dir.mkdir(parents=True)
+
+    def record(ts: str) -> dict:
+        return {
+            "sessionId": "sess-gap",
+            "timestamp": ts,
+            "type": "assistant",
+            "message": {"model": "claude-opus-4-6", "usage": {}},
+        }
+
+    (project_dir / "session.jsonl").write_text(
+        "\n".join(
+            json.dumps(record(ts))
+            for ts in (
+                "2026-02-10T09:00:00Z",
+                "2026-02-10T09:10:00Z",  # >5 min gap: a new stretch
+                "2026-02-10T09:12:00Z",
+                "2026-02-11T08:00:00Z",  # slept
+                "2026-02-11T08:04:00Z",
+            )
+        )
+    )
+
+    session = ClaudeCodeCollector(data_dir=tmp_path).collect()[0]
+
+    span = (session.end_time - session.start_time).total_seconds() / 60
+    assert span == pytest.approx(1384.0)  # what last-minus-first used to report
+    assert session.duration_minutes == pytest.approx(6.0)  # 0 + 2 + 4
+    assert len(session.active_intervals) == 3
+
+
 def test_claude_code_not_available(tmp_path: Path) -> None:
     collector = ClaudeCodeCollector(data_dir=tmp_path / "nonexistent")
     assert not collector.is_available()
@@ -155,6 +191,44 @@ def test_codex_collector(tmp_path: Path) -> None:
     assert s.tokens.cache_read_tokens == 100
     assert s.tokens.total == 700
     assert s.message_count == 2  # 1 user_message + 1 assistant response_item
+
+
+def test_codex_rollout_open_for_days_counts_only_its_active_stretches(
+    tmp_path: Path,
+) -> None:
+    """A rollout file is a long-lived process, not a unit of work."""
+    day_dir = tmp_path / "sessions" / "2026" / "02" / "10"
+    day_dir.mkdir(parents=True)
+
+    records = [
+        {
+            "timestamp": "2026-02-10T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "daemon", "cwd": "/synthetic/project"},
+        },
+    ]
+    for ts in (
+        "2026-02-10T10:01:00Z",
+        "2026-02-10T10:03:00Z",
+        "2026-02-24T15:00:00Z",  # same process, two weeks later
+        "2026-02-24T15:02:00Z",
+    ):
+        records.append(
+            {
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": {"role": "assistant", "content": []},
+            }
+        )
+    (day_dir / "rollout-daemon.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records)
+    )
+
+    session = CodexCollector(data_dir=tmp_path).collect(days=36500)[0]
+
+    span = (session.end_time - session.start_time).total_seconds() / 60
+    assert span > 14 * 1440  # the old measurement: a "session" lasting weeks
+    assert session.duration_minutes == pytest.approx(5.0)  # 3 + 2
 
 
 def test_codex_collector_deduplicates_copied_fork_snapshots(
@@ -326,6 +400,32 @@ def test_gemini_cli_collector(tmp_path: Path) -> None:
     assert s.project == "my-project"
 
 
+def test_gemini_cli_uses_message_timestamps_not_the_session_span(
+    tmp_path: Path,
+) -> None:
+    chats_dir = tmp_path / "tmp" / "my-project" / "chats"
+    chats_dir.mkdir(parents=True)
+    (chats_dir / "session-idle.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "idle-1",
+                "startTime": "2026-02-10T10:00:00Z",
+                "lastUpdated": "2026-02-10T18:00:00Z",
+                "messages": [
+                    {"id": "m1", "timestamp": "2026-02-10T10:00:00Z", "type": "user"},
+                    {"id": "m2", "timestamp": "2026-02-10T10:02:00Z", "type": "user"},
+                    {"id": "m3", "timestamp": "2026-02-10T17:58:00Z", "type": "user"},
+                    {"id": "m4", "timestamp": "2026-02-10T18:00:00Z", "type": "user"},
+                ],
+            }
+        )
+    )
+
+    session = GeminiCliCollector(data_dir=tmp_path).collect(days=36500)[0]
+
+    assert session.duration_minutes == pytest.approx(4.0)  # 2 + 2, not 480
+
+
 def test_gemini_cli_not_available(tmp_path: Path) -> None:
     collector = GeminiCliCollector(data_dir=tmp_path / "nonexistent")
     assert not collector.is_available()
@@ -380,3 +480,46 @@ def test_opencode_collector(tmp_path: Path) -> None:
     assert s.tokens.output_tokens == 100
     assert s.tokens.cache_read_tokens == 50
     assert s.tokens.cache_write_tokens == 10
+
+
+def test_opencode_uses_message_timestamps_not_the_session_span(
+    tmp_path: Path,
+) -> None:
+    storage = tmp_path / "storage"
+    session_dir = storage / "session" / "proj1"
+    session_dir.mkdir(parents=True)
+    message_dir = storage / "message" / "ses_idle"
+    message_dir.mkdir(parents=True)
+
+    base = 1707560000000  # ms
+    minute = 60_000
+    (session_dir / "ses_idle.json").write_text(
+        json.dumps(
+            {
+                "id": "ses_idle",
+                "directory": "/synthetic/project",
+                # Session metadata spans four hours...
+                "time": {"created": base, "updated": base + 240 * minute},
+            }
+        )
+    )
+    # ...but the assistant only worked for two minutes at each end of it.
+    for index, (created, completed) in enumerate(
+        [(base, base + 2 * minute), (base + 238 * minute, base + 240 * minute)]
+    ):
+        (message_dir / f"msg_{index}.json").write_text(
+            json.dumps(
+                {
+                    "id": f"msg_{index}",
+                    "sessionID": "ses_idle",
+                    "role": "assistant",
+                    "modelID": "minimax-m2.1",
+                    "time": {"created": created, "completed": completed},
+                    "tokens": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
+                }
+            )
+        )
+
+    session = OpenCodeCollector(data_dir=tmp_path).collect()[0]
+
+    assert session.duration_minutes == pytest.approx(4.0)  # 2 + 2, not 240

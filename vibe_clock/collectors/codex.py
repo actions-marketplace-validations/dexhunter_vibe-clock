@@ -13,6 +13,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ..intervals import intervals_from_timestamps
 from ..models import Session, TokenUsage
 from .base import BaseCollector
 
@@ -164,16 +165,21 @@ class CodexCollector(BaseCollector):
         if models:
             model = max(models, key=models.get)  # type: ignore[arg-type]
 
+        # A rollout file is a long-lived CLI process, not a unit of work: it can
+        # stay open for weeks. Only its active stretches count as time spent.
+        intervals = intervals_from_timestamps(timestamps)
+
         return Session(
             session_id=session_id,
             agent="codex",
-            start_time=min(timestamps),
-            end_time=max(timestamps),
+            start_time=intervals[0][0],
+            end_time=intervals[-1][1],
             model=model,
             project=project,
             message_count=message_count,
             tokens=tokens,
             model_tokens=dict(model_tokens),
+            active_intervals=intervals,
         )
 
 

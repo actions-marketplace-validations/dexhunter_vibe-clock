@@ -30,7 +30,7 @@ def _sample_stats() -> AgentStats:
         active_agents=["claude_code", "codex"],
         favorite_model="claude-opus-4-6",
         peak_hour=14,
-        longest_session_minutes=120.0,
+        longest_stretch_minutes=120.0,
         daily=[
             DailyActivity(
                 date=date(2026, 2, 10),

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from vibe_clock.aggregator import aggregate
 from vibe_clock.config import Config
+from vibe_clock.intervals import intervals_from_timestamps
 from vibe_clock.models import AgentStats, Session, TokenUsage
 from vibe_clock.sanitizer import preview, public_payload, sanitize
 
@@ -51,6 +52,115 @@ def test_aggregate_basic() -> None:
     assert len(stats.daily) == 2  # Feb 10, Feb 11
     assert len(stats.models) == 2  # claude-opus-4-6, gpt-5.1
     assert set(stats.active_agents) == {"claude_code", "codex"}
+
+
+def _at(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def test_long_running_session_counts_active_time_not_span() -> None:
+    """A session open for days bills only the minutes it was actually working."""
+    # Three bursts of work spread over four days, with multi-hour silences
+    # between them. Timestamps are two minutes apart, i.e. inside the idle
+    # threshold, so each burst is one continuous stretch.
+    bursts = [
+        ("2026-02-10T09:00:00Z", "2026-02-10T09:30:00Z"),  # 30 min
+        ("2026-02-12T14:00:00Z", "2026-02-12T14:20:00Z"),  # 20 min
+        ("2026-02-14T22:00:00Z", "2026-02-14T22:10:00Z"),  # 10 min
+    ]
+    timestamps: list[datetime] = []
+    for start, end in bursts:
+        cursor, stop = _at(start), _at(end)
+        while cursor <= stop:
+            timestamps.append(cursor)
+            cursor += timedelta(minutes=2)
+
+    session = Session(
+        session_id="daemon",
+        agent="codex",
+        start_time=timestamps[0],
+        end_time=timestamps[-1],
+        model="gpt-5.1",
+        project="proj",
+        active_intervals=intervals_from_timestamps(timestamps),
+    )
+
+    span_minutes = (timestamps[-1] - timestamps[0]).total_seconds() / 60
+    assert span_minutes > 4 * 1440  # the old measurement: over four days
+
+    stats = aggregate([session], Config(default_days=30), end_at=_WINDOW_END)
+
+    assert session.duration_minutes == 60.0  # 30 + 20 + 10
+    assert stats.total_minutes == 60.0
+    assert stats.longest_stretch_minutes == 30.0
+    assert stats.active_days == 3
+    assert {d.date.isoformat(): d.total_minutes for d in stats.daily} == {
+        "2026-02-10": 30.0,
+        "2026-02-12": 20.0,
+        "2026-02-14": 10.0,
+    }
+
+
+def test_concurrent_sessions_share_wall_clock_minutes() -> None:
+    """Two agents running at once cost one wall-clock minute, not two."""
+    overlapping = [
+        _make_session(sid="a", start="2026-02-10T10:00:00Z", end="2026-02-10T11:00:00Z"),
+        _make_session(
+            sid="b",
+            agent="codex",
+            start="2026-02-10T10:30:00Z",
+            end="2026-02-10T11:30:00Z",
+        ),
+    ]
+
+    stats = aggregate(overlapping, Config(default_days=30), end_at=_WINDOW_END)
+
+    assert sum(s.duration_minutes for s in overlapping) == 120.0
+    assert stats.total_minutes == 90.0
+    assert stats.daily[0].total_minutes == 90.0
+
+
+def test_no_day_can_exceed_twenty_four_hours() -> None:
+    sessions = [
+        _make_session(
+            sid=f"s{index}",
+            start="2026-02-10T00:00:00Z",
+            end="2026-02-10T23:59:00Z",
+        )
+        for index in range(5)
+    ]
+
+    stats = aggregate(sessions, Config(default_days=30), end_at=_WINDOW_END)
+
+    assert max(d.total_minutes for d in stats.daily) <= 1440
+
+
+def test_session_crossing_midnight_splits_across_days() -> None:
+    session = _make_session(
+        start="2026-02-10T23:00:00Z", end="2026-02-11T01:00:00Z"
+    )
+
+    stats = aggregate([session], Config(default_days=30), end_at=_WINDOW_END)
+
+    assert {d.date.isoformat(): d.total_minutes for d in stats.daily} == {
+        "2026-02-10": 60.0,
+        "2026-02-11": 60.0,
+    }
+    assert stats.active_days == 2
+
+
+def test_session_starting_before_the_window_still_counts_inside_it() -> None:
+    """Clipping keeps in-window minutes that a start-time filter would drop."""
+    session = _make_session(
+        start="2026-01-29T22:00:00Z", end="2026-01-30T02:00:00Z"
+    )
+    config = Config(default_days=30)
+
+    stats = aggregate([session], config, end_at=_WINDOW_END)
+
+    # Window opens 2026-01-30T00:00Z, so only the last two hours count.
+    assert stats.total_sessions == 1
+    assert stats.total_minutes == 120.0
 
 
 def test_aggregate_filters_old_sessions() -> None:

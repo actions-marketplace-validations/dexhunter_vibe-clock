@@ -11,6 +11,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from ..intervals import intervals_from_timestamps
 from ..models import Session, TokenUsage
 from .base import BaseCollector
 
@@ -122,9 +123,10 @@ class _SessionAcc:
         self.models: dict[str, int] = defaultdict(int)
 
     def to_session(self) -> Session:
-        if self.timestamps:
-            start = min(self.timestamps)
-            end = max(self.timestamps)
+        intervals = intervals_from_timestamps(self.timestamps)
+        if intervals:
+            start = intervals[0][0]
+            end = intervals[-1][1]
         else:
             start = datetime.now(timezone.utc)
             end = None
@@ -143,4 +145,5 @@ class _SessionAcc:
             project=self.project,
             message_count=self.message_count,
             tokens=self.tokens,
+            active_intervals=intervals,
         )

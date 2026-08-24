@@ -7,6 +7,13 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
 from .config import Config
+from .intervals import (
+    Interval,
+    clip_intervals,
+    longest_stretch_minutes,
+    minutes_by_utc_day,
+    union_minutes,
+)
 from .models import (
     AgentStats,
     DailyActivity,
@@ -23,13 +30,19 @@ def aggregate(
     *,
     end_at: datetime | None = None,
 ) -> AgentStats:
-    """Aggregate raw sessions into AgentStats, applying privacy filters."""
+    """Aggregate raw sessions into AgentStats, applying privacy filters.
+
+    Minutes are wall-clock active time: each session's active stretches are
+    clipped to the window and then unioned, so overlapping sessions cost one
+    minute, not two. Per-model and per-project minutes are unioned within their
+    own group, so they legitimately do not add up to ``total_minutes`` when two
+    groups were active at the same moment.
+    """
     days = config.default_days
     window_end = end_at or datetime.now(timezone.utc)
     cutoff = window_end - timedelta(days=days)
 
-    # Filter by date range
-    filtered = [s for s in sessions if cutoff <= s.start_time < window_end]
+    filtered = list(sessions)
 
     # Filter excluded date ranges
     for dr in config.privacy.exclude_date_ranges:
@@ -56,7 +69,16 @@ def aggregate(
             )
         ]
 
-    if not filtered:
+    # Clip every session's active stretches to the window instead of dropping
+    # whole sessions by start time — a session that opened before the window
+    # still spent real minutes inside it.
+    windowed: list[tuple[Session, list[Interval]]] = []
+    for s in filtered:
+        in_window = clip_intervals(s.active_intervals, cutoff, window_end)
+        if in_window:
+            windowed.append((s, in_window))
+
+    if not windowed:
         return AgentStats(days_covered=days)
 
     # Group by date
@@ -65,20 +87,20 @@ def aggregate(
     project_map: dict[tuple[str, str], _ProjectAcc] = defaultdict(_ProjectAcc)
     hour_counts: dict[int, int] = defaultdict(int)
     agents_seen: set[str] = set()
-    longest_minutes = 0.0
+    all_intervals: list[Interval] = []
 
     total_tokens = TokenUsage()
     total_messages = 0
 
-    for s in filtered:
-        d = s.start_time.date()
-        dur = s.duration_minutes
+    for s, in_window in windowed:
+        # The first in-window stretch, not the raw start time, which may sit
+        # outside the window entirely.
+        d = in_window[0][0].date()
 
         # Daily
         acc = daily_map[d]
         acc.session_count += 1
         acc.message_count += s.message_count
-        acc.total_minutes += dur
         _add_tokens(acc.tokens, s.tokens)
 
         # Model-level activity stays attached to the session's primary model,
@@ -87,7 +109,7 @@ def aggregate(
         macc = model_map[s.model]
         macc.session_count += 1
         macc.message_count += s.message_count
-        macc.total_minutes += dur
+        macc.intervals.extend(in_window)
         if s.model_tokens:
             for model, tokens in s.model_tokens.items():
                 _add_tokens(model_map[model].tokens, tokens)
@@ -98,16 +120,23 @@ def aggregate(
         key = (s.project, s.agent)
         pacc = project_map[key]
         pacc.session_count += 1
-        pacc.total_minutes += dur
+        pacc.intervals.extend(in_window)
         _add_tokens(pacc.tokens, s.tokens)
 
         # Totals
         _add_tokens(total_tokens, s.tokens)
         total_messages += s.message_count
-        hour_counts[s.start_time.hour] += 1
+        hour_counts[in_window[0][0].hour] += 1
         agents_seen.add(s.agent)
-        if dur > longest_minutes:
-            longest_minutes = dur
+        all_intervals.extend(in_window)
+
+    # Minutes are unioned across every session before being reported, so two
+    # agents running at once cost one wall-clock minute, not two. Splitting the
+    # union at UTC midnight is what keeps a day from exceeding 1440 minutes.
+    daily_minutes = minutes_by_utc_day(all_intervals)
+    for d in daily_minutes:
+        # A day that only holds spill-over minutes is still an active day.
+        daily_map.setdefault(d, _DailyAcc())
 
     # Build hourly distribution (24 slots)
     hourly = [hour_counts.get(h, 0) for h in range(24)]
@@ -125,7 +154,7 @@ def aggregate(
                 date=d,
                 session_count=a.session_count,
                 message_count=a.message_count,
-                total_minutes=round(a.total_minutes, 1),
+                total_minutes=round(daily_minutes.get(d, 0.0), 1),
                 tokens=a.tokens,
             )
             for d, a in daily_map.items()
@@ -139,7 +168,7 @@ def aggregate(
                 model=m,
                 session_count=a.session_count,
                 message_count=a.message_count,
-                total_minutes=round(a.total_minutes, 1),
+                total_minutes=round(union_minutes(a.intervals), 1),
                 tokens=a.tokens,
             )
             for m, a in model_map.items()
@@ -154,7 +183,7 @@ def aggregate(
                 project=proj,
                 agent=agent,
                 session_count=a.session_count,
-                total_minutes=round(a.total_minutes, 1),
+                total_minutes=round(union_minutes(a.intervals), 1),
                 tokens=a.tokens,
             )
             for (proj, agent), a in project_map.items()
@@ -166,14 +195,14 @@ def aggregate(
     return AgentStats(
         days_covered=days,
         active_days=len(daily),
-        total_sessions=len(filtered),
+        total_sessions=len(windowed),
         total_messages=total_messages,
-        total_minutes=round(sum(s.duration_minutes for s in filtered), 1),
+        total_minutes=round(union_minutes(all_intervals), 1),
         total_tokens=total_tokens,
         active_agents=sorted(agents_seen),
         favorite_model=favorite,
         peak_hour=peak_hour,
-        longest_session_minutes=round(longest_minutes, 1),
+        longest_stretch_minutes=round(longest_stretch_minutes(all_intervals), 1),
         hourly=hourly,
         daily=daily,
         models=models,
@@ -192,7 +221,6 @@ class _DailyAcc:
     def __init__(self) -> None:
         self.session_count = 0
         self.message_count = 0
-        self.total_minutes = 0.0
         self.tokens = TokenUsage()
 
 
@@ -200,12 +228,12 @@ class _ModelAcc:
     def __init__(self) -> None:
         self.session_count = 0
         self.message_count = 0
-        self.total_minutes = 0.0
+        self.intervals: list[Interval] = []
         self.tokens = TokenUsage()
 
 
 class _ProjectAcc:
     def __init__(self) -> None:
         self.session_count = 0
-        self.total_minutes = 0.0
+        self.intervals: list[Interval] = []
         self.tokens = TokenUsage()
