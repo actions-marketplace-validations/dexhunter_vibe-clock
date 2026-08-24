@@ -179,7 +179,7 @@ def _print_overview(stats: "AgentStats") -> None:
     t.add_column(style="cyan")
     t.add_column(style="bold white")
     t.add_row(
-        "⏱  Active Time",
+        "⏱  Agent Time",
         format_hours(stats.total_minutes),
         "🤖 Favorite Model",
         stats.favorite_model or "—",

@@ -30,8 +30,14 @@ def render_card(stats: AgentStats, theme: str = "dark") -> str:
 
     # Every value here is a field the public payload always carries, so none of
     # them can silently fall back to a plausible-looking default.
+    #
+    # "Agent Time", not "Active Time": the number is wall-clock time during
+    # which an agent was emitting events, which is not the same as time you
+    # spent. An autonomous run working through the night is agent time and no
+    # log can tell whether you were at the keyboard, so the label says what is
+    # actually measured rather than implying a person was there.
     rows = [
-        ("Active Time", format_hours(stats.total_minutes)),
+        ("Agent Time", format_hours(stats.total_minutes)),
         ("Sessions", str(stats.total_sessions)),
         ("Active Days", str(stats.active_days)),
         ("Top Model Family", escape(stats.favorite_model) if stats.favorite_model else "—"),

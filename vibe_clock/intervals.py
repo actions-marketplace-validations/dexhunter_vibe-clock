@@ -34,10 +34,19 @@ Interval = tuple[datetime, datetime]
 # than a few minutes therefore means nothing was running, including during
 # unattended autonomous work.
 #
-# The exact value is deliberately not load-bearing: measured against real logs,
-# the reported daily average moves only from 11.2 h/day at 5 minutes to
-# 12.5 h/day at 30 minutes, so no plausible choice of threshold changes the
-# picture. 5 minutes is the most conservative of those.
+# How much the exact value matters, measured rather than assumed:
+#
+# * For `total_minutes`, little. Against real logs the daily average moves
+#   smoothly from 9.6 h/day at a 30-second threshold to 12.4 h/day at 30
+#   minutes — no cliff, so the headline number does not hinge on the constant.
+# * For `longest_stretch_minutes`, a great deal. Real turns leave gaps of up to
+#   ~3 minutes between records, so that metric swings by several times over the
+#   same sweep: whether a long autonomous run reads as one stretch or many is
+#   decided by this constant. It is reported in `vibe-clock summary` and is
+#   deliberately *not* part of the public payload for that reason.
+#
+# 5 minutes is long enough to survive a slow model turn and short enough to end
+# a stretch when nothing was running.
 IDLE_THRESHOLD_MINUTES = 5.0
 
 

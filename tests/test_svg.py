@@ -86,12 +86,15 @@ def test_card_renders_valid_svg() -> None:
     assert "42" in svg  # total sessions
 
 
-def test_card_shows_active_time_instead_of_active_agents() -> None:
+def test_card_shows_agent_time_instead_of_active_agents() -> None:
     svg = render_card(_sample_stats(), theme="dark")
 
     assert "Active Agents" not in svg
     assert "claude_code, codex" not in svg
-    assert "Active Time" in svg
+    # "Agent Time", not "Active Time": no log can tell whether a person was at
+    # the keyboard, so the card must not imply one was.
+    assert "Agent Time" in svg
+    assert "Active Time" not in svg
     assert "10.0 hrs" in svg  # 600 minutes
     assert "Active Days" in svg
 
