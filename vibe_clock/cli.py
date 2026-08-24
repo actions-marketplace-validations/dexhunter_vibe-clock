@@ -818,24 +818,41 @@ def _resolve_token(config: Config, assume_yes: bool) -> str:
 
 
 def _resolve_profile_repo(config: Config, given: str | None, assume_yes: bool) -> str:
-    """Decide which repo renders the SVGs. Never guessed silently."""
-    candidate = given or config.github.profile_repo
-    if not candidate:
+    """Decide which repo renders the SVGs. Suggested, never silently assumed.
+
+    Guessing `<login>/<login>` without asking is how `push` ended up warning
+    about a repo the user had never named.
+    """
+    if given:
+        return _valid_slug(given)
+
+    suggestion = config.github.profile_repo
+    if not suggestion:
         login = gh.login()
         if login:
-            candidate = f"{login}/{login}"
+            suggestion = f"{login}/{login}"
             console.print(f"  [dim]`gh` says you are {login}[/dim]")
-    if not candidate and not assume_yes:
-        candidate = click.prompt("  Profile repo (owner/repo)", default="", show_default=False)
-    if not candidate:
-        raise click.ClickException(
-            "could not determine your profile repo. Pass --profile-repo owner/repo."
-        )
-    if candidate.count("/") != 1 or not all(candidate.split("/")):
-        raise click.ClickException(f"--profile-repo must look like owner/repo, got {candidate!r}")
-    if not assume_yes and given is None:
-        candidate = click.prompt("  Profile repo (owner/repo)", default=candidate)
-    return candidate
+
+    if assume_yes:
+        if not suggestion:
+            raise click.ClickException(
+                "could not determine your profile repo. Pass --profile-repo owner/repo."
+            )
+        return _valid_slug(suggestion)
+
+    answer = click.prompt(
+        "  Profile repo (owner/repo)",
+        default=suggestion or None,
+        show_default=bool(suggestion),
+    )
+    return _valid_slug(answer)
+
+
+def _valid_slug(value: str) -> str:
+    value = value.strip()
+    if value.count("/") != 1 or not all(value.split("/")):
+        raise click.ClickException(f"profile repo must look like owner/repo, got {value!r}")
+    return value
 
 
 def _chart_names(charts: str) -> list[str]:

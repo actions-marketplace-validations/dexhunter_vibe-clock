@@ -377,3 +377,36 @@ def test_schedule_warns_systemd_users_about_lingering(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert "enable-linger" in result.output
+
+
+def test_setup_asks_once_and_suggests_the_gh_login(wired, monkeypatch) -> None:
+    """The suggestion is offered as a default, never assumed silently, and the
+    user is asked exactly once."""
+    _config, published, _saved = wired
+    asked: list[str] = []
+    monkeypatch.setattr("vibe_clock.cli.gh.login", lambda: "someone")
+
+    real_prompt = __import__("click").prompt
+
+    def counting_prompt(text, *args, **kwargs):
+        asked.append(text)
+        return real_prompt(text, *args, **kwargs)
+
+    monkeypatch.setattr("vibe_clock.cli.click.prompt", counting_prompt)
+
+    result = CliRunner().invoke(setup, ["--no-schedule"], input="\ny\n")
+
+    assert result.exit_code == 0, result.output
+    assert len([t for t in asked if "Profile repo" in t]) == 1
+    assert published[0].github.profile_repo == "someone/someone"
+
+
+def test_setup_rejects_a_malformed_repo_typed_at_the_prompt(wired, monkeypatch) -> None:
+    _config, published, _saved = wired
+    monkeypatch.setattr("vibe_clock.cli.gh.login", lambda: None)
+
+    result = CliRunner().invoke(setup, ["--no-schedule"], input="not-a-slug\n")
+
+    assert result.exit_code != 0
+    assert "owner/repo" in result.output
+    assert not published
