@@ -34,12 +34,12 @@ DOC_FILES = [
 VERSION_RE = re.compile(r"^version\s*=\s*\"(.+?)\"", re.MULTILINE)
 # Owner-agnostic, so a fork's own ref is bumped instead of silently skipped.
 ACTION_REF_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/vibe-clock@v[\d.]+")
-ACTION_REF_CONST_RE = re.compile(r'ACTION_REF = "(.+?)@v[\d.]+"')
+ACTION_OWNER_RE = re.compile(r'ACTION_OWNER = "(.+?)"')
 
 
 def action_owner() -> str:
-    """The owner half of the action ref currently in workflow.py."""
-    match = ACTION_REF_CONST_RE.search(WORKFLOW_PY.read_text())
+    """The owner half of the action ref, read from workflow.py."""
+    match = ACTION_OWNER_RE.search(WORKFLOW_PY.read_text())
     return match.group(1) if match else "dexhunter/vibe-clock"
 
 
@@ -76,13 +76,10 @@ def bump(new_version: str) -> None:
     PYPROJECT.write_text(text)
     print(f"  pyproject.toml: {old_version} -> {new_version}")
 
-    # 2. Update the action ref that the workflow template is generated from
+    # 2. `vibe_clock.__version__` reads the installed package metadata, and
+    #    ACTION_REF is derived from it, so bumping pyproject.toml is what moves
+    #    the pin. Nothing else to edit — that is the point of deriving it.
     new_ref = f"{action_owner()}@v{new_version}"
-    workflow_text = WORKFLOW_PY.read_text()
-    updated_workflow = ACTION_REF_CONST_RE.sub(f'ACTION_REF = "{new_ref}"', workflow_text)
-    if updated_workflow != workflow_text:
-        WORKFLOW_PY.write_text(updated_workflow)
-        print(f"  vibe_clock/workflow.py: ACTION_REF -> {new_ref}")
 
     # 3. Update any action ref written out longhand in the docs
     for doc in DOC_FILES:

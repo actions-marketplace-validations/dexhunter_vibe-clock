@@ -112,3 +112,14 @@ def test_no_doc_names_a_command_that_does_not_exist(doc: Path) -> None:
     # "vibe-clock reads them" is not mistaken for a subcommand.
     invoked = set(re.findall(r"^\s*(?:\$ )?vibe-clock ([a-z_]+)", doc.read_text(), re.M))
     assert invoked <= set(cli.commands), sorted(invoked - set(cli.commands))
+
+
+def test_the_action_pin_tracks_the_package_version() -> None:
+    """A literal pin went stale: the docs told every new user to install
+    `@v1.4.1`, a tag that predates the sanitizing renderer, the schema-skew
+    guard and the card change those same docs describe. `action.yml` installs
+    the action's own checkout rather than PyPI, so the tag decides which code
+    renders a reader's profile."""
+    from vibe_clock import __version__
+
+    assert ACTION_REF.endswith(f"@v{__version__}")

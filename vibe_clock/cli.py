@@ -911,7 +911,8 @@ def _install_workflow(profile_repo: str, charts: str, assume_yes: bool) -> None:
     """Write the workflow into the profile repo checkout, or print it."""
     yaml = workflow_yaml(chart_types=charts)
     cwd = Path.cwd()
-    if _git_slug(cwd) == profile_repo:
+    in_profile_repo = _git_slug(cwd) == profile_repo
+    if in_profile_repo:
         target = cwd / WORKFLOW_PATH
         action = "Overwrite" if target.exists() else "Write"
         if _confirm(f"  {action} {target}?", assume_yes):
@@ -919,6 +920,15 @@ def _install_workflow(profile_repo: str, charts: str, assume_yes: bool) -> None:
             target.write_text(yaml)
             console.print(f"  [green]✓[/green] {target} — commit and push it")
             return
+    else:
+        # Say why, at the moment it matters. Run from $HOME — the obvious place
+        # right after `uv tool install` — setup otherwise quietly prints YAML
+        # where the docs said a file would be written, with no hint that
+        # standing in the repo is what makes the difference.
+        console.print(
+            f"  [dim]This is not a {profile_repo} checkout, so no file is written. "
+            f"`cd` there and re-run to have it written for you.[/dim]"
+        )
     console.print(
         f"  Create [bold]{WORKFLOW_PATH}[/bold] in {profile_repo} with:\n"
         "  [dim](or run `vibe-clock workflow` from inside that checkout)[/dim]"

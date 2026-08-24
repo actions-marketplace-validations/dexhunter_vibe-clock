@@ -13,6 +13,8 @@ and a test asserts every README embeds it verbatim. There is one copy.
 
 from __future__ import annotations
 
+from . import __version__
+
 # Name is load-bearing: `push --trigger-workflow` dispatches this file by name.
 WORKFLOW_FILENAME = "vibe-clock.yml"
 WORKFLOW_PATH = f".github/workflows/{WORKFLOW_FILENAME}"
@@ -23,9 +25,17 @@ WORKFLOW_PATH = f".github/workflows/{WORKFLOW_FILENAME}"
 DEFAULT_CRON = "30 0 * * *"
 DEFAULT_CHART_TYPES = "card,donut"
 
+# Where the composite action lives. A fork changes this one line.
+ACTION_OWNER = "dexhunter/vibe-clock"
+
 # Pinned to an exact release, not a branch: a moving ref would let an upstream
 # change rewrite your profile without you asking.
-ACTION_REF = "dexhunter/vibe-clock@v1.4.1"
+#
+# Derived from the package version rather than written out, because a literal
+# went stale the moment a release bumped one and not the other — and the pin is
+# load-bearing: `action.yml` installs the action's own checkout, not PyPI, so
+# the tag named here decides which code renders a reader's profile.
+ACTION_REF = f"{ACTION_OWNER}@v{__version__}"
 
 
 def workflow_yaml(
