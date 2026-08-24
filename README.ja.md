@@ -281,9 +281,8 @@ trigger_workflow = false           # 下記参照
 enabled = ["claude_code", "codex", "gemini_cli", "opencode"]
 
 [privacy]
-exclude_projects = []       # 部分一致。該当プロジェクトは丸ごと除外
+exclude_projects = []       # グロブまたは単純な部分文字列。大文字小文字は区別しません
 exclude_date_ranges = []    # [["2026-01-01", "2026-01-07"], ...]
-anonymize_projects = true
 public_sharing_enabled = false
 public_days = 7
 share_daily_activity = false

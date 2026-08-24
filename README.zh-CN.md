@@ -281,9 +281,8 @@ trigger_workflow = false           # 见下文
 enabled = ["claude_code", "codex", "gemini_cli", "opencode"]
 
 [privacy]
-exclude_projects = []       # 子串匹配；命中的项目会被整个丢弃
+exclude_projects = []       # 通配符或纯子串，不区分大小写
 exclude_date_ranges = []    # [["2026-01-01", "2026-01-07"], ...]
-anonymize_projects = true
 public_sharing_enabled = false
 public_days = 7
 share_daily_activity = false

@@ -63,10 +63,7 @@ def aggregate(
         filtered = [
             s
             for s in filtered
-            if not any(
-                fnmatch.fnmatch(s.project, pat)
-                for pat in config.privacy.exclude_projects
-            )
+            if not _is_excluded(s.project, config.privacy.exclude_projects)
         ]
 
     # Clip every session's active stretches to the window instead of dropping
@@ -207,6 +204,25 @@ def aggregate(
         daily=daily,
         models=models,
         projects=projects,
+    )
+
+
+def _is_excluded(project: str, patterns: list[str]) -> bool:
+    """Whether a project matches an `exclude_projects` entry.
+
+    A pattern matches either as a shell glob or as a plain substring, and case
+    is ignored. This is the escape hatch for keeping a client or an NDA repo out
+    of your stats, so it has to work the obvious way: glob-only matching meant
+    `exclude_projects = ["acme"]` silently excluded nothing unless a project was
+    named exactly `acme`, and silence is the worst possible answer here.
+    Accepting both forms can only ever exclude more, never less.
+    """
+    haystack = project.casefold()
+    return any(
+        fnmatch.fnmatchcase(haystack, pattern.casefold())
+        or pattern.casefold() in haystack
+        for pattern in patterns
+        if pattern
     )
 
 

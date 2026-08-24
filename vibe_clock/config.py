@@ -46,9 +46,16 @@ class GithubConfig(BaseModel):
 
 
 class PrivacyConfig(BaseModel):
+    # Glob patterns or plain substrings, case-insensitive; a matching project is
+    # dropped from every statistic.
     exclude_projects: list[str] = Field(default_factory=list)
     exclude_date_ranges: list[list[str]] = Field(default_factory=list)
-    anonymize_projects: bool = True
+    # NOTE: `anonymize_projects` used to be documented here. It was read by
+    # nothing, so setting it to `false` did not disable anonymisation and
+    # setting it to `true` did not enable anything. Project names are aliased
+    # unconditionally by `sanitizer._public_projects`, and are only published at
+    # all behind `share_project_aliases`. Old config files still load: pydantic
+    # ignores the extra key.
     public_sharing_enabled: bool = False
     public_days: int = 7
     share_daily_activity: bool = False
@@ -143,7 +150,6 @@ def save_config(config: Config) -> None:
         "[privacy]",
         f'exclude_projects = {config.privacy.exclude_projects}',
         f'exclude_date_ranges = {config.privacy.exclude_date_ranges}',
-        f'anonymize_projects = {"true" if config.privacy.anonymize_projects else "false"}',
         f'public_sharing_enabled = {"true" if config.privacy.public_sharing_enabled else "false"}',
         f'public_days = {config.privacy.public_days}',
         f'share_daily_activity = {"true" if config.privacy.share_daily_activity else "false"}',

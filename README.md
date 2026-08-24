@@ -281,9 +281,8 @@ trigger_workflow = false           # see below
 enabled = ["claude_code", "codex", "gemini_cli", "opencode"]
 
 [privacy]
-exclude_projects = []       # substrings; matching projects are dropped entirely
+exclude_projects = []       # glob patterns or plain substrings, case-insensitive
 exclude_date_ranges = []    # [["2026-01-01", "2026-01-07"], ...]
-anonymize_projects = true
 public_sharing_enabled = false
 public_days = 7
 share_daily_activity = false
