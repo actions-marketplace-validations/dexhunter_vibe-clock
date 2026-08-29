@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..models import Session
@@ -18,6 +19,11 @@ class BaseCollector(ABC):
         return self.data_dir.exists()
 
     @abstractmethod
-    def collect(self) -> list[Session]:
+    def collect(self, days: int = 365) -> list[Session]:
         """Collect sessions from this agent's data directory."""
         ...
+
+    def _cutoff_timestamp(self, days: int) -> float:
+        """Return a Unix timestamp for `days` ago (for mtime comparison)."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        return cutoff.timestamp()

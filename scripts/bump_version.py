@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Bump vibe-clock version in pyproject.toml and propagate to all files.
+"""Bump the vibe-clock version and propagate it everywhere it is written down.
 
-Usage: python scripts/bump_version.py 1.5.0
+Usage:
+    python scripts/bump_version.py 1.5.0
+    python scripts/bump_version.py patch|minor|major
+
+The action reference in the docs is generated from `vibe_clock/workflow.py`, so
+this script updates that constant and the docs follow. Before this existed as
+part of the release flow, the release workflow bumped only pyproject.toml and
+every `@vX.Y.Z` pin in the docs silently went stale.
 """
 
 from __future__ import annotations
@@ -13,16 +20,39 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
 
-# Files that contain `dexhunter/vibe-clock@vX.Y.Z` references
-README_FILES = [
+WORKFLOW_PY = ROOT / "vibe_clock" / "workflow.py"
+
+# Files that may contain a `<owner>/vibe-clock@vX.Y.Z` reference.
+DOC_FILES = [
     ROOT / "README.md",
     ROOT / "README.zh-CN.md",
     ROOT / "README.ja.md",
     ROOT / "README.es.md",
+    ROOT / "SKILL.md",
 ]
 
 VERSION_RE = re.compile(r"^version\s*=\s*\"(.+?)\"", re.MULTILINE)
-ACTION_REF_RE = re.compile(r"dexhunter/vibe-clock@v[\d.]+")
+# Owner-agnostic, so a fork's own ref is bumped instead of silently skipped.
+ACTION_REF_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/vibe-clock@v[\d.]+")
+ACTION_OWNER_RE = re.compile(r'ACTION_OWNER = "(.+?)"')
+
+
+def action_owner() -> str:
+    """The owner half of the action ref, read from workflow.py."""
+    match = ACTION_OWNER_RE.search(WORKFLOW_PY.read_text())
+    return match.group(1) if match else "dexhunter/vibe-clock"
+
+
+def resolve_version(argument: str) -> str:
+    """Accept an explicit version or a patch/minor/major bump keyword."""
+    if argument not in ("patch", "minor", "major"):
+        return argument
+    major, minor, patch = (int(part) for part in read_current_version().split("."))
+    if argument == "major":
+        return f"{major + 1}.0.0"
+    if argument == "minor":
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
 
 
 def read_current_version() -> str:
@@ -46,23 +76,27 @@ def bump(new_version: str) -> None:
     PYPROJECT.write_text(text)
     print(f"  pyproject.toml: {old_version} -> {new_version}")
 
-    # 2. Update action refs in READMEs
-    new_ref = f"dexhunter/vibe-clock@v{new_version}"
-    for readme in README_FILES:
-        if not readme.exists():
+    # 2. `vibe_clock.__version__` reads the installed package metadata, and
+    #    ACTION_REF is derived from it, so bumping pyproject.toml is what moves
+    #    the pin. Nothing else to edit — that is the point of deriving it.
+    new_ref = f"{action_owner()}@v{new_version}"
+
+    # 3. Update any action ref written out longhand in the docs
+    for doc in DOC_FILES:
+        if not doc.exists():
             continue
-        content = readme.read_text()
+        content = doc.read_text()
         updated = ACTION_REF_RE.sub(new_ref, content)
         if updated != content:
-            readme.write_text(updated)
-            print(f"  {readme.name}: updated action ref to v{new_version}")
+            doc.write_text(updated)
+            print(f"  {doc.name}: updated action ref to v{new_version}")
 
     print(f"\nBumped to {new_version}. Review changes, then commit.")
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <new-version>")
+        print(f"Usage: {sys.argv[0]} <new-version|patch|minor|major>")
         print(f"Current version: {read_current_version()}")
         sys.exit(1)
-    bump(sys.argv[1])
+    bump(resolve_version(sys.argv[1]))

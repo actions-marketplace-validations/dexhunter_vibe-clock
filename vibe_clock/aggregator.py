@@ -7,6 +7,13 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
 from .config import Config
+from .intervals import (
+    Interval,
+    clip_intervals,
+    longest_stretch_minutes,
+    minutes_by_utc_day,
+    union_minutes,
+)
 from .models import (
     AgentStats,
     DailyActivity,
@@ -17,13 +24,25 @@ from .models import (
 )
 
 
-def aggregate(sessions: list[Session], config: Config) -> AgentStats:
-    """Aggregate raw sessions into AgentStats, applying privacy filters."""
-    days = config.default_days
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+def aggregate(
+    sessions: list[Session],
+    config: Config,
+    *,
+    end_at: datetime | None = None,
+) -> AgentStats:
+    """Aggregate raw sessions into AgentStats, applying privacy filters.
 
-    # Filter by date range
-    filtered = [s for s in sessions if s.start_time >= cutoff]
+    Minutes are wall-clock active time: each session's active stretches are
+    clipped to the window and then unioned, so overlapping sessions cost one
+    minute, not two. Per-model and per-project minutes are unioned within their
+    own group, so they legitimately do not add up to ``total_minutes`` when two
+    groups were active at the same moment.
+    """
+    days = config.default_days
+    window_end = end_at or datetime.now(timezone.utc)
+    cutoff = window_end - timedelta(days=days)
+
+    filtered = list(sessions)
 
     # Filter excluded date ranges
     for dr in config.privacy.exclude_date_ranges:
@@ -44,13 +63,19 @@ def aggregate(sessions: list[Session], config: Config) -> AgentStats:
         filtered = [
             s
             for s in filtered
-            if not any(
-                fnmatch.fnmatch(s.project, pat)
-                for pat in config.privacy.exclude_projects
-            )
+            if not _is_excluded(s.project, config.privacy.exclude_projects)
         ]
 
-    if not filtered:
+    # Clip every session's active stretches to the window instead of dropping
+    # whole sessions by start time — a session that opened before the window
+    # still spent real minutes inside it.
+    windowed: list[tuple[Session, list[Interval]]] = []
+    for s in filtered:
+        in_window = clip_intervals(s.active_intervals, cutoff, window_end)
+        if in_window:
+            windowed.append((s, in_window))
+
+    if not windowed:
         return AgentStats(days_covered=days)
 
     # Group by date
@@ -59,43 +84,59 @@ def aggregate(sessions: list[Session], config: Config) -> AgentStats:
     project_map: dict[tuple[str, str], _ProjectAcc] = defaultdict(_ProjectAcc)
     hour_counts: dict[int, int] = defaultdict(int)
     agents_seen: set[str] = set()
-    longest_minutes = 0.0
+    all_intervals: list[Interval] = []
 
     total_tokens = TokenUsage()
     total_messages = 0
 
-    for s in filtered:
-        d = s.start_time.date()
-        dur = s.duration_minutes
+    for s, in_window in windowed:
+        # Every UTC day this session was actually active on, not just the day it
+        # started: a session that ran past midnight is a session on both days.
+        # Counting only the first day left a day holding 22 hours of activity
+        # blank on the heatmap, because those charts key off the session count.
+        days_active = sorted(minutes_by_utc_day(in_window))
+        d = days_active[0]
 
-        # Daily
+        # Daily. Messages and tokens are per-session totals with no per-day
+        # split available, so they land on the first day rather than being
+        # counted once per day the session touched.
+        for day in days_active:
+            daily_map[day].session_count += 1
         acc = daily_map[d]
-        acc.session_count += 1
         acc.message_count += s.message_count
-        acc.total_minutes += dur
         _add_tokens(acc.tokens, s.tokens)
 
-        # Model
+        # Model-level activity stays attached to the session's primary model,
+        # while collectors that provide per-model token splits keep tokens on
+        # the model that actually consumed them.
         macc = model_map[s.model]
         macc.session_count += 1
         macc.message_count += s.message_count
-        macc.total_minutes += dur
-        _add_tokens(macc.tokens, s.tokens)
+        macc.intervals.extend(in_window)
+        if s.model_tokens:
+            for model, tokens in s.model_tokens.items():
+                _add_tokens(model_map[model].tokens, tokens)
+        else:
+            _add_tokens(macc.tokens, s.tokens)
 
         # Project
         key = (s.project, s.agent)
         pacc = project_map[key]
         pacc.session_count += 1
-        pacc.total_minutes += dur
+        pacc.intervals.extend(in_window)
         _add_tokens(pacc.tokens, s.tokens)
 
         # Totals
         _add_tokens(total_tokens, s.tokens)
         total_messages += s.message_count
-        hour_counts[s.start_time.hour] += 1
+        hour_counts[in_window[0][0].hour] += 1
         agents_seen.add(s.agent)
-        if dur > longest_minutes:
-            longest_minutes = dur
+        all_intervals.extend(in_window)
+
+    # Minutes are unioned across every session before being reported, so two
+    # agents running at once cost one wall-clock minute, not two. Splitting the
+    # union at UTC midnight is what keeps a day from exceeding 1440 minutes.
+    daily_minutes = minutes_by_utc_day(all_intervals)
 
     # Build hourly distribution (24 slots)
     hourly = [hour_counts.get(h, 0) for h in range(24)]
@@ -113,7 +154,7 @@ def aggregate(sessions: list[Session], config: Config) -> AgentStats:
                 date=d,
                 session_count=a.session_count,
                 message_count=a.message_count,
-                total_minutes=round(a.total_minutes, 1),
+                total_minutes=round(daily_minutes.get(d, 0.0), 1),
                 tokens=a.tokens,
             )
             for d, a in daily_map.items()
@@ -127,7 +168,7 @@ def aggregate(sessions: list[Session], config: Config) -> AgentStats:
                 model=m,
                 session_count=a.session_count,
                 message_count=a.message_count,
-                total_minutes=round(a.total_minutes, 1),
+                total_minutes=round(union_minutes(a.intervals), 1),
                 tokens=a.tokens,
             )
             for m, a in model_map.items()
@@ -142,7 +183,7 @@ def aggregate(sessions: list[Session], config: Config) -> AgentStats:
                 project=proj,
                 agent=agent,
                 session_count=a.session_count,
-                total_minutes=round(a.total_minutes, 1),
+                total_minutes=round(union_minutes(a.intervals), 1),
                 tokens=a.tokens,
             )
             for (proj, agent), a in project_map.items()
@@ -153,18 +194,38 @@ def aggregate(sessions: list[Session], config: Config) -> AgentStats:
 
     return AgentStats(
         days_covered=days,
-        total_sessions=len(filtered),
+        active_days=len(daily),
+        total_sessions=len(windowed),
         total_messages=total_messages,
-        total_minutes=round(sum(s.duration_minutes for s in filtered), 1),
+        total_minutes=round(union_minutes(all_intervals), 1),
         total_tokens=total_tokens,
         active_agents=sorted(agents_seen),
         favorite_model=favorite,
         peak_hour=peak_hour,
-        longest_session_minutes=round(longest_minutes, 1),
+        longest_stretch_minutes=round(longest_stretch_minutes(all_intervals), 1),
         hourly=hourly,
         daily=daily,
         models=models,
         projects=projects,
+    )
+
+
+def _is_excluded(project: str, patterns: list[str]) -> bool:
+    """Whether a project matches an `exclude_projects` entry.
+
+    A pattern matches either as a shell glob or as a plain substring, and case
+    is ignored. This is the escape hatch for keeping a client or an NDA repo out
+    of your stats, so it has to work the obvious way: glob-only matching meant
+    `exclude_projects = ["acme"]` silently excluded nothing unless a project was
+    named exactly `acme`, and silence is the worst possible answer here.
+    Accepting both forms can only ever exclude more, never less.
+    """
+    haystack = project.casefold()
+    return any(
+        fnmatch.fnmatchcase(haystack, pattern.casefold())
+        or pattern.casefold() in haystack
+        for pattern in patterns
+        if pattern
     )
 
 
@@ -179,7 +240,6 @@ class _DailyAcc:
     def __init__(self) -> None:
         self.session_count = 0
         self.message_count = 0
-        self.total_minutes = 0.0
         self.tokens = TokenUsage()
 
 
@@ -187,12 +247,12 @@ class _ModelAcc:
     def __init__(self) -> None:
         self.session_count = 0
         self.message_count = 0
-        self.total_minutes = 0.0
+        self.intervals: list[Interval] = []
         self.tokens = TokenUsage()
 
 
 class _ProjectAcc:
     def __init__(self) -> None:
         self.session_count = 0
-        self.total_minutes = 0.0
+        self.intervals: list[Interval] = []
         self.tokens = TokenUsage()

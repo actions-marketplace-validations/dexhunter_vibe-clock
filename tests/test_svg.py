@@ -30,7 +30,7 @@ def _sample_stats() -> AgentStats:
         active_agents=["claude_code", "codex"],
         favorite_model="claude-opus-4-6",
         peak_hour=14,
-        longest_session_minutes=120.0,
+        longest_stretch_minutes=120.0,
         daily=[
             DailyActivity(
                 date=date(2026, 2, 10),
@@ -86,6 +86,19 @@ def test_card_renders_valid_svg() -> None:
     assert "42" in svg  # total sessions
 
 
+def test_card_shows_agent_time_instead_of_active_agents() -> None:
+    svg = render_card(_sample_stats(), theme="dark")
+
+    assert "Active Agents" not in svg
+    assert "claude_code, codex" not in svg
+    # "Agent Time", not "Active Time": no log can tell whether a person was at
+    # the keyboard, so the card must not imply one was.
+    assert "Agent Time" in svg
+    assert "Active Time" not in svg
+    assert "10.0 hrs" in svg  # 600 minutes
+    assert "Active Days" in svg
+
+
 def test_card_light_theme() -> None:
     svg = render_card(_sample_stats(), theme="light")
     assert "#ffffff" in svg
@@ -112,11 +125,44 @@ def test_donut_empty() -> None:
     assert "No data" in svg
 
 
+def test_donut_groups_models_beyond_eight() -> None:
+    stats = AgentStats(
+        models=[
+            ModelBreakdown(model=f"model-{index}", session_count=1)
+            for index in range(9)
+        ]
+    )
+
+    svg = render_donut(stats)
+
+    assert svg.count("<path") == 8
+    assert "model-7" not in svg
+    assert "model-8" not in svg
+    assert "Other" in svg
+    assert ">9</text>" in svg
+
+
 def test_bars_renders_valid_svg() -> None:
     svg = render_bars(_sample_stats(), theme="dark")
     assert svg.startswith("<svg")
     assert "</svg>" in svg
     assert "Project A" in svg
+
+
+def test_bars_uses_gemini_color() -> None:
+    stats = AgentStats(
+        projects=[
+            ProjectBreakdown(
+                project="Project Gemini",
+                agent="gemini_cli",
+                session_count=1,
+            )
+        ]
+    )
+
+    svg = render_bars(stats, theme="dark")
+
+    assert 'fill="#8957e5"' in svg
 
 
 def test_bars_empty() -> None:

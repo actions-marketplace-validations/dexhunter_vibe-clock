@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from vibe_clock.collectors.claude_code import ClaudeCodeCollector
 from vibe_clock.collectors.codex import CodexCollector
 from vibe_clock.collectors.gemini_cli import GeminiCliCollector
@@ -18,6 +20,12 @@ def test_claude_code_collector(tmp_path: Path) -> None:
     jsonl = project_dir / "session.jsonl"
 
     records = [
+        {
+            "sessionId": "sess-001",
+            "timestamp": "2026-02-10T09:59:00Z",
+            "type": "user",
+            "message": {"content": "hello"},
+        },
         {
             "sessionId": "sess-001",
             "timestamp": "2026-02-10T10:00:00Z",
@@ -53,6 +61,13 @@ def test_claude_code_collector(tmp_path: Path) -> None:
             "type": "progress",
             "message": {},
         },
+        # Tool results use the user role but are not human messages
+        {
+            "sessionId": "sess-001",
+            "timestamp": "2026-02-10T10:03:00Z",
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "content": "ok"}]},
+        },
     ]
     jsonl.write_text("\n".join(json.dumps(r) for r in records))
 
@@ -66,12 +81,46 @@ def test_claude_code_collector(tmp_path: Path) -> None:
     assert s.session_id == "sess-001"
     assert s.agent == "claude_code"
     assert s.model == "claude-opus-4-6"
-    assert s.message_count == 2
+    assert s.message_count == 3
     assert s.tokens.input_tokens == 180
     assert s.tokens.output_tokens == 90
     assert s.tokens.cache_read_tokens == 350
     assert s.tokens.cache_write_tokens == 50
     assert s.project == "my-project"
+
+
+def test_claude_code_session_excludes_idle_gaps(tmp_path: Path) -> None:
+    """An overnight break inside one conversation is not time spent."""
+    project_dir = tmp_path / "projects" / "my-project"
+    project_dir.mkdir(parents=True)
+
+    def record(ts: str) -> dict:
+        return {
+            "sessionId": "sess-gap",
+            "timestamp": ts,
+            "type": "assistant",
+            "message": {"model": "claude-opus-4-6", "usage": {}},
+        }
+
+    (project_dir / "session.jsonl").write_text(
+        "\n".join(
+            json.dumps(record(ts))
+            for ts in (
+                "2026-02-10T09:00:00Z",
+                "2026-02-10T09:10:00Z",  # >5 min gap: a new stretch
+                "2026-02-10T09:12:00Z",
+                "2026-02-11T08:00:00Z",  # slept
+                "2026-02-11T08:04:00Z",
+            )
+        )
+    )
+
+    session = ClaudeCodeCollector(data_dir=tmp_path).collect()[0]
+
+    span = (session.end_time - session.start_time).total_seconds() / 60
+    assert span == pytest.approx(1384.0)  # what last-minus-first used to report
+    assert session.duration_minutes == pytest.approx(6.0)  # 0 + 2 + 4
+    assert len(session.active_intervals) == 3
 
 
 def test_claude_code_not_available(tmp_path: Path) -> None:
@@ -135,10 +184,144 @@ def test_codex_collector(tmp_path: Path) -> None:
     assert s.session_id == "abc123"
     assert s.agent == "codex"
     assert s.model == "gpt-5.1-codex"
-    assert s.tokens.input_tokens == 500
+    # Codex reports cached input as a subset of input_tokens. Keep the cache
+    # breakdown without counting it twice in TokenUsage.total.
+    assert s.tokens.input_tokens == 400
     assert s.tokens.output_tokens == 200
     assert s.tokens.cache_read_tokens == 100
+    assert s.tokens.total == 700
     assert s.message_count == 2  # 1 user_message + 1 assistant response_item
+
+
+def test_codex_rollout_open_for_days_counts_only_its_active_stretches(
+    tmp_path: Path,
+) -> None:
+    """A rollout file is a long-lived process, not a unit of work."""
+    day_dir = tmp_path / "sessions" / "2026" / "02" / "10"
+    day_dir.mkdir(parents=True)
+
+    records = [
+        {
+            "timestamp": "2026-02-10T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "daemon", "cwd": "/synthetic/project"},
+        },
+    ]
+    for ts in (
+        "2026-02-10T10:01:00Z",
+        "2026-02-10T10:03:00Z",
+        "2026-02-24T15:00:00Z",  # same process, two weeks later
+        "2026-02-24T15:02:00Z",
+    ):
+        records.append(
+            {
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": {"role": "assistant", "content": []},
+            }
+        )
+    (day_dir / "rollout-daemon.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records)
+    )
+
+    session = CodexCollector(data_dir=tmp_path).collect(days=36500)[0]
+
+    span = (session.end_time - session.start_time).total_seconds() / 60
+    assert span > 14 * 1440  # the old measurement: a "session" lasting weeks
+    assert session.duration_minutes == pytest.approx(5.0)  # 3 + 2
+
+
+def test_codex_collector_deduplicates_copied_fork_snapshots(
+    tmp_path: Path,
+) -> None:
+    sessions_dir = tmp_path / "sessions" / "2030" / "01" / "01"
+    archived_dir = tmp_path / "archived_sessions"
+    sessions_dir.mkdir(parents=True)
+    archived_dir.mkdir()
+
+    copied = {
+        "timestamp": "2030-01-01T10:01:00Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "model": "gpt-other",
+                "last_token_usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                },
+                "total_token_usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                },
+            },
+        },
+    }
+    unique = {
+        "timestamp": "2030-01-01T10:02:00Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "model": "gpt-test",
+                "last_token_usage": {
+                    "input_tokens": 50,
+                    "cached_input_tokens": 40,
+                    "output_tokens": 5,
+                    "total_tokens": 55,
+                },
+                "total_token_usage": {
+                    "input_tokens": 150,
+                    "cached_input_tokens": 60,
+                    "output_tokens": 15,
+                    "total_tokens": 165,
+                },
+            },
+        },
+    }
+    parent = [
+        {
+            "timestamp": "2030-01-01T10:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "parent", "cwd": "/tmp/project"},
+        },
+        copied,
+    ]
+    child = [
+        {
+            "timestamp": "2030-01-01T10:00:30Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "child",
+                "forked_from_id": "parent",
+                "cwd": "/tmp/project",
+            },
+        },
+        copied,
+        unique,
+    ]
+    (sessions_dir / "rollout-parent.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in parent)
+    )
+    (archived_dir / "rollout-child.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in child)
+    )
+
+    sessions = CodexCollector(data_dir=tmp_path).collect(days=365)
+
+    assert len(sessions) == 2
+    combined = sum(session.tokens.total for session in sessions)
+    assert combined == 165
+    by_model: dict[str, int] = {}
+    for session in sessions:
+        for model, usage in session.model_tokens.items():
+            by_model[model] = by_model.get(model, 0) + usage.total
+    assert by_model == {"gpt-other": 110, "gpt-test": 55}
+    assert sum(by_model.values()) == combined
 
 
 def test_gemini_cli_collector(tmp_path: Path) -> None:
@@ -217,6 +400,32 @@ def test_gemini_cli_collector(tmp_path: Path) -> None:
     assert s.project == "my-project"
 
 
+def test_gemini_cli_uses_message_timestamps_not_the_session_span(
+    tmp_path: Path,
+) -> None:
+    chats_dir = tmp_path / "tmp" / "my-project" / "chats"
+    chats_dir.mkdir(parents=True)
+    (chats_dir / "session-idle.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "idle-1",
+                "startTime": "2026-02-10T10:00:00Z",
+                "lastUpdated": "2026-02-10T18:00:00Z",
+                "messages": [
+                    {"id": "m1", "timestamp": "2026-02-10T10:00:00Z", "type": "user"},
+                    {"id": "m2", "timestamp": "2026-02-10T10:02:00Z", "type": "user"},
+                    {"id": "m3", "timestamp": "2026-02-10T17:58:00Z", "type": "user"},
+                    {"id": "m4", "timestamp": "2026-02-10T18:00:00Z", "type": "user"},
+                ],
+            }
+        )
+    )
+
+    session = GeminiCliCollector(data_dir=tmp_path).collect(days=36500)[0]
+
+    assert session.duration_minutes == pytest.approx(4.0)  # 2 + 2, not 480
+
+
 def test_gemini_cli_not_available(tmp_path: Path) -> None:
     collector = GeminiCliCollector(data_dir=tmp_path / "nonexistent")
     assert not collector.is_available()
@@ -266,8 +475,165 @@ def test_opencode_collector(tmp_path: Path) -> None:
     assert s.session_id == "ses_001"
     assert s.agent == "opencode"
     assert s.model == "minimax-m2.1"
-    assert s.message_count == 1  # Only assistant messages counted
+    assert s.message_count == 2  # User message + assistant response
     assert s.tokens.input_tokens == 300
     assert s.tokens.output_tokens == 100
     assert s.tokens.cache_read_tokens == 50
     assert s.tokens.cache_write_tokens == 10
+
+
+def test_opencode_uses_message_timestamps_not_the_session_span(
+    tmp_path: Path,
+) -> None:
+    storage = tmp_path / "storage"
+    session_dir = storage / "session" / "proj1"
+    session_dir.mkdir(parents=True)
+    message_dir = storage / "message" / "ses_idle"
+    message_dir.mkdir(parents=True)
+
+    base = 1707560000000  # ms
+    minute = 60_000
+    (session_dir / "ses_idle.json").write_text(
+        json.dumps(
+            {
+                "id": "ses_idle",
+                "directory": "/synthetic/project",
+                # Session metadata spans four hours...
+                "time": {"created": base, "updated": base + 240 * minute},
+            }
+        )
+    )
+    # ...but the assistant only worked for two minutes at each end of it.
+    for index, (created, completed) in enumerate(
+        [(base, base + 2 * minute), (base + 238 * minute, base + 240 * minute)]
+    ):
+        (message_dir / f"msg_{index}.json").write_text(
+            json.dumps(
+                {
+                    "id": f"msg_{index}",
+                    "sessionID": "ses_idle",
+                    "role": "assistant",
+                    "modelID": "minimax-m2.1",
+                    "time": {"created": created, "completed": completed},
+                    "tokens": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
+                }
+            )
+        )
+
+    session = OpenCodeCollector(data_dir=tmp_path).collect()[0]
+
+    assert session.duration_minutes == pytest.approx(4.0)  # 2 + 2, not 240
+
+
+def test_opencode_does_not_invent_a_day_from_the_session_record(tmp_path: Path) -> None:
+    """The distrusted `time.created` must not be seeded in among real events.
+
+    It was, one line under a comment explaining that the field is untrustworthy.
+    That injected a zero-length stretch on the day the session record was
+    created, so a session created on Tuesday and worked on Wednesday reported
+    two active days, one of them holding 0.0 minutes.
+    """
+    from datetime import datetime, timezone
+
+    from vibe_clock.aggregator import aggregate
+    from vibe_clock.config import Config
+
+    storage = tmp_path / "storage"
+    (storage / "session" / "proj1").mkdir(parents=True)
+    message_dir = storage / "message" / "ses_split"
+    message_dir.mkdir(parents=True)
+
+    created = int(datetime(2026, 2, 10, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    worked = int(datetime(2026, 2, 11, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    (storage / "session" / "proj1" / "ses_split.json").write_text(
+        json.dumps(
+            {
+                "id": "ses_split",
+                "directory": "/synthetic/project",
+                "time": {"created": created, "updated": worked + 120_000},
+            }
+        )
+    )
+    (message_dir / "msg_0.json").write_text(
+        json.dumps(
+            {
+                "id": "msg_0",
+                "sessionID": "ses_split",
+                "role": "assistant",
+                "modelID": "minimax-m2.1",
+                "time": {"created": worked, "completed": worked + 120_000},
+                "tokens": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}},
+            }
+        )
+    )
+
+    sessions = OpenCodeCollector(data_dir=tmp_path).collect()
+    stats = aggregate(
+        sessions,
+        Config(default_days=30),
+        end_at=datetime(2026, 3, 1, tzinfo=timezone.utc),
+    )
+
+    assert stats.total_minutes == pytest.approx(2.0)
+    assert stats.active_days == 1
+    assert [d.date.isoformat() for d in stats.daily] == ["2026-02-11"]
+
+
+def test_opencode_falls_back_to_a_point_when_no_message_has_a_time(
+    tmp_path: Path,
+) -> None:
+    """No evidence of duration is not evidence of a four-hour session."""
+    storage = tmp_path / "storage"
+    (storage / "session" / "proj1").mkdir(parents=True)
+    (storage / "message" / "ses_bare").mkdir(parents=True)
+    base = 1707560000000
+    (storage / "session" / "proj1" / "ses_bare.json").write_text(
+        json.dumps(
+            {
+                "id": "ses_bare",
+                "directory": "/synthetic/project",
+                "time": {"created": base, "updated": base + 240 * 60_000},
+            }
+        )
+    )
+
+    session = OpenCodeCollector(data_dir=tmp_path).collect()[0]
+
+    assert session.duration_minutes == pytest.approx(0.0)
+
+
+def test_gemini_cli_does_not_invent_a_day_from_the_session_record(
+    tmp_path: Path,
+) -> None:
+    chats = tmp_path / "tmp" / "myproject" / "chats"
+    chats.mkdir(parents=True)
+    (chats / "session-split.json").write_text(
+        json.dumps(
+            {
+                "sessionId": "g-split",
+                "startTime": "2026-02-10T10:00:00Z",
+                "lastUpdated": "2026-02-11T10:02:00Z",
+                "messages": [
+                    {
+                        "type": "gemini",
+                        "timestamp": "2026-02-11T10:00:00Z",
+                        "model": "gemini-3-pro",
+                        "tokens": {"input": 10, "output": 5},
+                    },
+                    {
+                        "type": "gemini",
+                        "timestamp": "2026-02-11T10:02:00Z",
+                        "model": "gemini-3-pro",
+                        "tokens": {"input": 10, "output": 5},
+                    },
+                ],
+            }
+        )
+    )
+
+    session = GeminiCliCollector(data_dir=tmp_path).collect()[0]
+
+    assert session.duration_minutes == pytest.approx(2.0)
+    assert [start.date().isoformat() for start, _ in session.active_intervals] == [
+        "2026-02-11"
+    ]

@@ -11,6 +11,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from ..intervals import intervals_from_timestamps
 from ..models import Session, TokenUsage
 from .base import BaseCollector
 
@@ -18,7 +19,7 @@ from .base import BaseCollector
 class ClaudeCodeCollector(BaseCollector):
     agent_name = "claude_code"
 
-    def collect(self) -> list[Session]:
+    def collect(self, days: int = 365) -> list[Session]:
         """Collect sessions from Claude Code JSONL project files."""
         sessions: dict[str, _SessionAcc] = {}
         projects_dir = self.data_dir / "projects"
@@ -54,13 +55,13 @@ class ClaudeCodeCollector(BaseCollector):
         if not session_id:
             return
 
-        # Only process assistant messages (they have token usage)
-        if record.get("type") != "assistant":
+        record_type = record.get("type")
+        if record_type == "user":
+            if not _is_human_user_message(record):
+                return
+        elif record_type != "assistant":
             return
 
-        msg = record.get("message", {})
-        usage = msg.get("usage", {})
-        model = msg.get("model", "unknown")
         timestamp_str = record.get("timestamp")
         if not timestamp_str:
             return
@@ -79,6 +80,13 @@ class ClaudeCodeCollector(BaseCollector):
         acc = sessions[session_id]
         acc.message_count += 1
         acc.timestamps.append(ts)
+
+        if record_type == "user":
+            return
+
+        msg = record.get("message", {})
+        usage = msg.get("usage", {})
+        model = msg.get("model", "unknown")
         acc.tokens.input_tokens += usage.get("input_tokens", 0)
         acc.tokens.output_tokens += usage.get("output_tokens", 0)
         acc.tokens.cache_read_tokens += usage.get("cache_read_input_tokens", 0)
@@ -87,6 +95,20 @@ class ClaudeCodeCollector(BaseCollector):
         )
         if model != "unknown":
             acc.models[model] += 1
+
+
+def _is_human_user_message(record: dict) -> bool:
+    """Exclude tool-result records that Claude stores with the user role."""
+    content = (record.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return any(
+            isinstance(item, str)
+            or (isinstance(item, dict) and item.get("type") == "text")
+            for item in content
+        )
+    return False
 
 
 class _SessionAcc:
@@ -101,9 +123,10 @@ class _SessionAcc:
         self.models: dict[str, int] = defaultdict(int)
 
     def to_session(self) -> Session:
-        if self.timestamps:
-            start = min(self.timestamps)
-            end = max(self.timestamps)
+        intervals = intervals_from_timestamps(self.timestamps)
+        if intervals:
+            start = intervals[0][0]
+            end = intervals[-1][1]
         else:
             start = datetime.now(timezone.utc)
             end = None
@@ -122,4 +145,5 @@ class _SessionAcc:
             project=self.project,
             message_count=self.message_count,
             tokens=self.tokens,
+            active_intervals=intervals,
         )

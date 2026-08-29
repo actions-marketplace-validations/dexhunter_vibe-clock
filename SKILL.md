@@ -1,13 +1,13 @@
 ---
 name: vibe-clock-setup
-description: Set up vibe-clock to track AI coding agent usage (Claude Code, Codex, OpenCode) and display SVG stats on a GitHub profile README.
+description: Set up vibe-clock to track AI coding agent usage (Claude Code, Codex, Gemini CLI, OpenCode) and display SVG stats on a GitHub profile README.
 license: MIT
 compatibility:
   - claude-code
   - codex-cli
   - opencode
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
   author: dexhunter
   repository: https://github.com/dexhunter/vibe-clock
 allowed-tools:
@@ -22,108 +22,91 @@ allowed-tools:
 
 # vibe-clock Setup
 
-You are setting up **vibe-clock**, a CLI tool that tracks AI coding agent usage across Claude Code, Codex, and OpenCode, then displays SVG visualizations on a GitHub profile README.
+You are helping a user set up **vibe-clock**: a CLI that reads the session logs Claude Code, Codex, Gemini CLI, and OpenCode already write locally, and turns them into SVG charts on the user's GitHub profile.
 
-## Architecture
+`vibe-clock setup` performs the entire installation interactively. **Prefer it over doing the steps yourself.** This document exists to tell you what it is doing, what it asks for, and what to do when a step cannot be automated. Do not restate configuration the tool prints — read its output and respond to it.
 
-```
-Local machine                  GitHub
-─────────────                  ──────
-~/.claude/                     Gist (vibe-clock-data.json)
-~/.codex/          ──push──▶        │
-~/.local/share/opencode/       Actions (daily cron)
-                                    │
-                               fetch gist → generate SVGs → commit to profile repo
+## The one command
+
+```bash
+uv tool install vibe-clock      # or pipx install vibe-clock / pip install vibe-clock
+vibe-clock setup
 ```
 
-Two-stage pipeline:
-1. **Local**: `vibe-clock push` collects sessions from agent data dirs, aggregates, sanitizes (strips all PII/paths/project names), and pushes safe JSON to a GitHub Gist.
-2. **Remote**: A GitHub Actions workflow in the user's `<username>/<username>` profile repo fetches the gist, generates SVGs via `vibe-clock render --from-json`, and commits them.
+`setup` will, asking before each step that changes anything outside the machine:
+
+1. Detect which agents have data directories.
+2. Get a GitHub token — borrowed from `gh auth` when the GitHub CLI is authenticated, otherwise prompted for, with the token-creation URL printed.
+3. Confirm the profile repo (defaults to `<login>/<login>` when `gh` can supply the login).
+4. Print the **exact JSON** it would publish and wait for confirmation.
+5. Create the public Gist.
+6. Set the `VIBE_CLOCK_GIST_ID` repository secret with `gh secret set`, or print where to paste it.
+7. Write `.github/workflows/vibe-clock.yml` if run from inside the profile repo checkout, or print it.
+8. Install a daily local `vibe-clock push` (launchd, systemd user timer, or crontab).
+9. Print the `<img>` markdown for the profile README.
+
+Non-interactive form, for when you already know the answers:
+
+```bash
+vibe-clock setup --profile-repo OWNER/REPO --charts card,donut --yes
+```
+
+`--yes` accepts every prompt, including publishing the Gist. Use it only when the user has explicitly agreed to publish.
 
 ## Prerequisites
 
 - Python 3.10+
-- A GitHub Classic Personal Access Token (PAT) with `gist` scope (fine-grained tokens do NOT support gists)
-- At least one supported agent installed: Claude Code (`~/.claude/`), Codex (`~/.codex/`), or OpenCode (`~/.local/share/opencode/`)
+- At least one supported agent with data: Claude Code (`~/.claude/`), Codex (`~/.codex/`), Gemini CLI (`~/.gemini/`), or OpenCode (`~/.local/share/opencode/`)
 - A GitHub profile repo (`<username>/<username>`) with a README.md
+- Either the `gh` CLI authenticated (`gh auth status`), **or** a **Classic** PAT with the `gist` scope. Fine-grained tokens cannot write Gists.
 
-## Step 1: Install vibe-clock
+The `gist` scope is all that is needed. The `repo` scope is required only for the optional `github.trigger_workflow` setting, which makes `push` dispatch the render workflow immediately instead of waiting for its daily cron. Leave it off unless the user asks — `repo` grants read/write to every one of their repositories.
 
-```bash
-pip install git+https://github.com/dexhunter/vibe-clock.git
-```
+## Privacy — cover this before running `share` or `setup`
 
-Or with uv:
-```bash
-uv tool install git+https://github.com/dexhunter/vibe-clock.git
-```
+Everything stays local until the user confirms a preview. Show them the preview:
 
-Verify the installation:
-```bash
-vibe-clock --version
-```
-
-## Step 2: Initialize configuration
-
-```bash
-vibe-clock init
-```
-
-This will:
-- Auto-detect which agents are available on the machine
-- Prompt for a GitHub PAT (Classic token with `gist` scope)
-- Write config to `~/.config/vibe-clock/config.toml`
-
-If the user already has a `GITHUB_TOKEN` environment variable, note that the TOML config token takes precedence when set. If the env var token lacks gist scope, make sure to enter the correct token during init.
-
-## Step 3: Verify local data collection
-
-```bash
-vibe-clock summary
-```
-
-This shows a terminal table with session counts, total time, token usage, favorite model, and peak hour. If no data appears, check that agent data directories exist and contain session files.
-
-## Step 4: Push sanitized stats to GitHub Gist
-
-First do a dry run to preview what will be pushed:
 ```bash
 vibe-clock push --dry-run
 ```
 
-Verify the output contains ONLY aggregated numbers — no file paths, project names, or personal information. Then push:
-```bash
-vibe-clock push
-```
+The default payload has exactly ten fields: `schema_version`, `producer_version`, `generated_at` (floored to UTC midnight), `days_covered`, `active_days`, `total_sessions`, `total_minutes`, `active_agents`, `favorite_model`, and `models[]` (family names and session counts).
 
-This creates a **public** gist named `vibe-clock-data.json`. Note the gist ID printed — it is automatically saved to the config file.
+Never published, regardless of flags: file paths, the home directory, the username, real project or repository names (aliased to `Project A`, `Project B`, …), raw model IDs (reduced to families such as `Claude` / `OpenAI`), prompts, responses, code, session IDs, git data, and hostnames. `sanitizer.py` builds the payload from an allowlist — that is the guarantee. `_validate_no_pii` sits behind it as a backstop assertion over the fields carrying machine-derived text, so a future bug crashes locally instead of publishing.
 
-To retrieve the gist ID later:
-```bash
-grep gist_id ~/.config/vibe-clock/config.toml
-```
+`vibe-clock render` draws from that same allowlisted payload whether it collects locally or reads a Gist, so its SVGs are safe to commit. `vibe-clock export` is the one command that writes unsanitized data to a file.
 
-## Step 5: Set up GitHub Actions in the profile repo
+Optional data is off unless requested, one flag each: `--daily-activity`, `--time-patterns`, `--message-counts`, `--token-counts`, `--project-aliases`. Enable only what the user asks for.
 
-The user's profile repo is `<username>/<username>` (e.g., `dexhunter/dexhunter`).
+To stop publishing, `vibe-clock unshare` deletes the Gist **and its revision history**. A public Gist retains every past revision, so this is the only thing that removes previously published data.
 
-### 5a: Add repository secret
+## When automation is not available
 
-Go to the profile repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**:
-- Name: `VIBE_CLOCK_GIST_ID`
-- Value: the gist ID from Step 4
+If `gh` is missing, `setup` prints what to do at each step. The manual equivalents:
 
-### 5b: Create the workflow file
+**Token** — [github.com/settings/tokens/new?scopes=gist](https://github.com/settings/tokens/new?scopes=gist&description=vibe-clock), Classic, `gist` scope.
 
-Create `.github/workflows/vibe-clock.yml` in the profile repo:
+**Secret** — profile repo → Settings → Secrets and variables → Actions → New repository secret, named `VIBE_CLOCK_GIST_ID`.
+
+**Workflow** — `vibe-clock workflow` prints the file; `vibe-clock workflow --write` writes it to `.github/workflows/vibe-clock.yml`. It is:
 
 ```yaml
 name: Update Vibe Clock Stats
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    # Runs after your local `vibe-clock push` updates the Gist.
+    - cron: "30 0 * * *"
   workflow_dispatch:
+
+# Required: the action commits the generated SVGs back to this repo, and
+# GITHUB_TOKEN is read-only by default.
+permissions:
+  contents: write
+
+concurrency:
+  group: vibe-clock
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -131,85 +114,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dexhunter/vibe-clock@main
+      - uses: dexhunter/vibe-clock@v1.5.0
         with:
           gist_id: ${{ secrets.VIBE_CLOCK_GIST_ID }}
+          chart_types: card,donut
 ```
 
-### 5c: Add SVGs to README.md
+The `permissions:` block is required. The action commits SVGs back to the repo, and `GITHUB_TOKEN` is read-only by default, so a workflow without it fails with a 403 on `git push`.
 
-Add this section to the profile repo's `README.md`:
+**README** — add the images the workflow generates:
 
 ```html
-<h2 align="center"> Vibe Clock </h2>
-
 <p align="center">
   <img src="images/vibe-clock-card.svg" alt="Vibe Clock Stats" />
-</p>
-<p align="center">
   <img src="images/vibe-clock-donut.svg" alt="Model Usage" />
-  <img src="images/vibe-clock-token-bars.svg" alt="Token Usage by Model" />
-</p>
-<p align="center">
-  <img src="images/vibe-clock-hourly.svg" alt="Activity by Hour" />
-  <img src="images/vibe-clock-weekly.svg" alt="Activity by Day of Week" />
 </p>
 ```
 
-Available chart types: `card`, `heatmap`, `donut`, `bars`, `token_bars`, `hourly`, `weekly`.
+Then run it once: profile repo → **Actions** → *Update Vibe Clock Stats* → **Run workflow**.
 
-## Step 6: Trigger the workflow
+## Two clocks, both required
 
-Go to the profile repo → **Actions** tab → "Update Vibe Clock Stats" → **Run workflow**.
+The local `vibe-clock push` writes the Gist; the Actions cron reads it and commits SVGs half an hour later. If the local push is not scheduled, the Gist goes stale and the profile freezes — the most common way a working setup silently stops working.
 
-Or if the user has a `gh` CLI token with workflow permissions:
 ```bash
-gh workflow run vibe-clock.yml --repo <username>/<username>
+vibe-clock schedule           # daily, at the local equivalent of 00:00 UTC
 ```
 
-## Ongoing Usage
-
-- Run `vibe-clock push` locally whenever you want to update stats (e.g., daily via cron or manually)
-- The GitHub Actions workflow runs daily at midnight UTC and regenerates SVGs automatically
-- To update stats on demand: push locally, then trigger the workflow
-
-## Configuration Reference
-
-Config file: `~/.config/vibe-clock/config.toml`
-
-```toml
-[general]
-default_days = 30
-theme = "dark"
-
-[paths]
-claude_code = "~/.claude"
-codex = "~/.codex"
-opencode = "~/.local/share/opencode"
-
-[github]
-token = ""
-gist_id = ""
-
-[agents]
-enabled = ["claude_code", "codex", "opencode"]
-
-[privacy]
-exclude_projects = []
-exclude_date_ranges = []
-anonymize_projects = true
-```
-
-Environment variable overrides (used when TOML value is empty): `GITHUB_TOKEN`, `VIBE_CLOCK_GIST_ID`, `VIBE_CLOCK_DAYS`.
-
-## Privacy
-
-Only aggregated numbers leave the machine. Never pushed: file paths, project names, message content, code, git info, or PII. Use `--dry-run` to verify before any push.
+Backends are chosen automatically: launchd on macOS, a systemd **user** timer on Linux, crontab otherwise. On Linux a user timer stops when the user logs out, unless `sudo loginctl enable-linger $USER` is set. Keep it a user unit: a system service with `ProtectHome=true` can neither execute a `uv tool` / `pipx` binary under `$HOME` nor read the agent logs. Windows has no backend — use WSL or Task Scheduler.
 
 ## Troubleshooting
 
-- **`vibe-clock: command not found`**: Ensure pip/uv installed it globally. Try `uv tool install --force git+https://github.com/dexhunter/vibe-clock.git`.
-- **Push fails with 401**: Token likely lacks `gist` scope. Must be a Classic PAT, not fine-grained.
-- **Push fails with connection error**: If behind a SOCKS proxy (`ALL_PROXY`), vibe-clock already uses `trust_env=False` to bypass it.
-- **SVGs don't render in GitHub README**: GitHub caches aggressively. Wait a few minutes or hard-refresh. Ensure SVGs use web-safe fonts (Arial, Helvetica).
-- **No sessions found**: Check that agent data directories exist (`~/.claude/projects/`, `~/.codex/sessions/`, `~/.local/share/opencode/storage/`).
+- **403 on `git push` in the workflow**: missing `permissions: contents: write`. Compare against `vibe-clock workflow`.
+- **`payload carries no schema_version`, or a version-skew error**: the machine running `push` is older than the action rendering it. `uv tool upgrade vibe-clock`, then push again. The failure is deliberate; the old behaviour was rendering a plausible but wrong number.
+- **`chart 'X' needs ...`**: a requested chart needs data that was never shared. Re-run `share` with the named flag, or drop the chart from `chart_types`.
+- **401 on push**: the token is fine-grained, or lacks `gist`. It must be a Classic PAT.
+- **`vibe-clock: command not found`**: `~/.local/bin` is not on PATH (`uv tool update-shell`). If `vibe-clock --version` disagrees with what was just installed, run `which -a vibe-clock` — a `uv tool` install shadows a Homebrew one.
+- **No sessions found**: check the agent data directories exist and contain session files (`~/.claude/projects/`, `~/.codex/sessions/`, `~/.gemini/`, `~/.local/share/opencode/storage/`).
+- **SVGs stale in the README**: GitHub caches proxied images; wait or hard-refresh.
+
+## Configuration reference
+
+Config lives at `~/.config/vibe-clock/config.toml` (`0600`, in a `0700` directory). Rather than reproducing it here, read the live file, or see the Configuration section of [README.md](README.md), which is kept in sync with `config.py`.
+
+Environment overrides: `GITHUB_TOKEN` (used only when the TOML token is empty), `VIBE_CLOCK_GIST_ID`, `VIBE_CLOCK_DAYS`.
+
+Note that `vibe-clock init` only creates or refreshes the config file. It does not create the Gist, set the secret, write the workflow, or schedule anything — that is what `setup` is for.

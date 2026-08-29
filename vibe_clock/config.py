@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from .workflow import WORKFLOW_FILENAME
+
 if sys.version_info >= (3, 11):
     import tomllib
 else:
@@ -30,13 +32,37 @@ class PathsConfig(BaseModel):
 class GithubConfig(BaseModel):
     token: str = ""
     gist_id: str = ""
+    # "owner/repo" that renders your SVGs. Empty means "not configured"; it is
+    # never guessed, because guessing produced a confusing 404 warning on every
+    # push for anyone whose profile repo is not <login>/<login>.
     profile_repo: str = ""
+    # Workflow file to dispatch, relative to .github/workflows/. Configurable
+    # because the name was previously hardcoded, so any other name 404'd.
+    workflow_file: str = WORKFLOW_FILENAME
+    # Dispatching a workflow needs a token with `repo` scope, which is far
+    # broader than the `gist` scope everything else needs. Off by default: the
+    # workflow's own cron covers the common case with no extra permission.
+    trigger_workflow: bool = False
 
 
 class PrivacyConfig(BaseModel):
+    # Glob patterns or plain substrings, case-insensitive; a matching project is
+    # dropped from every statistic.
     exclude_projects: list[str] = Field(default_factory=list)
     exclude_date_ranges: list[list[str]] = Field(default_factory=list)
-    anonymize_projects: bool = True
+    # NOTE: `anonymize_projects` used to be documented here. It was read by
+    # nothing, so setting it to `false` did not disable anonymisation and
+    # setting it to `true` did not enable anything. Project names are aliased
+    # unconditionally by `sanitizer._public_projects`, and are only published at
+    # all behind `share_project_aliases`. Old config files still load: pydantic
+    # ignores the extra key.
+    public_sharing_enabled: bool = False
+    public_days: int = 7
+    share_daily_activity: bool = False
+    share_message_counts: bool = False
+    share_token_counts: bool = False
+    share_time_patterns: bool = False
+    share_project_aliases: bool = False
 
 
 class ScheduleConfig(BaseModel):
@@ -115,6 +141,8 @@ def save_config(config: Config) -> None:
         f'token = "{config.github.token}"',
         f'gist_id = "{config.github.gist_id}"',
         f'profile_repo = "{config.github.profile_repo}"',
+        f'workflow_file = "{config.github.workflow_file}"',
+        f'trigger_workflow = {"true" if config.github.trigger_workflow else "false"}',
         "",
         "[agents]",
         f'enabled = {config.enabled_agents}',
@@ -122,7 +150,13 @@ def save_config(config: Config) -> None:
         "[privacy]",
         f'exclude_projects = {config.privacy.exclude_projects}',
         f'exclude_date_ranges = {config.privacy.exclude_date_ranges}',
-        f'anonymize_projects = {"true" if config.privacy.anonymize_projects else "false"}',
+        f'public_sharing_enabled = {"true" if config.privacy.public_sharing_enabled else "false"}',
+        f'public_days = {config.privacy.public_days}',
+        f'share_daily_activity = {"true" if config.privacy.share_daily_activity else "false"}',
+        f'share_message_counts = {"true" if config.privacy.share_message_counts else "false"}',
+        f'share_token_counts = {"true" if config.privacy.share_token_counts else "false"}',
+        f'share_time_patterns = {"true" if config.privacy.share_time_patterns else "false"}',
+        f'share_project_aliases = {"true" if config.privacy.share_project_aliases else "false"}',
         "",
         "[schedule]",
         f'enabled = {"true" if config.schedule.enabled else "false"}',

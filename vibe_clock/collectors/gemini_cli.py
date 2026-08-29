@@ -15,6 +15,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from ..intervals import intervals_from_timestamps
 from ..models import Session, TokenUsage
 from .base import BaseCollector
 
@@ -74,8 +75,18 @@ class GeminiCliCollector(BaseCollector):
         tokens = TokenUsage()
         models: dict[str, int] = defaultdict(int)
         message_count = 0
+        # `startTime`/`lastUpdated` span the whole conversation including idle
+        # time; per-message timestamps show when it was actually working. The
+        # distrusted metadata value is not seeded in among them, because that
+        # invented a zero-length stretch on the session-creation day and counted
+        # it as an extra active day.
+        timestamps: list[datetime] = []
 
         for msg in data.get("messages", []):
+            msg_ts = _parse_timestamp(msg.get("timestamp"))
+            if msg_ts is not None:
+                timestamps.append(msg_ts)
+
             msg_type = msg.get("type")
             if msg_type == "gemini":
                 message_count += 1
@@ -93,6 +104,16 @@ class GeminiCliCollector(BaseCollector):
         if models:
             model = max(models, key=models.get)  # type: ignore[arg-type]
 
+        if not timestamps:
+            # No message carried a usable timestamp: record that the session
+            # happened without billing the untrusted conversation span.
+            timestamps = [start_time]
+
+        intervals = intervals_from_timestamps(timestamps)
+        last_event = intervals[-1][1]
+        if end_time is None or last_event > end_time:
+            end_time = last_event
+
         return Session(
             session_id=session_id,
             agent="gemini_cli",
@@ -102,4 +123,14 @@ class GeminiCliCollector(BaseCollector):
             project=project,
             message_count=message_count,
             tokens=tokens,
+            active_intervals=intervals,
         )
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None

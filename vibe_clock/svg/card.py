@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from html import escape
 
-from ..formatting import format_number
+from ..formatting import format_hours
 from ..models import AgentStats
 
 _DARK = {
@@ -27,33 +27,36 @@ _LIGHT = {
 
 def render_card(stats: AgentStats, theme: str = "dark") -> str:
     c = _DARK if theme == "dark" else _LIGHT
-    hours = stats.total_minutes / 60
 
+    # Every value here is a field the public payload always carries, so none of
+    # them can silently fall back to a plausible-looking default.
+    #
+    # "Agent Time", not "Active Time": the number is wall-clock time during
+    # which an agent was emitting events, which is not the same as time you
+    # spent. An autonomous run working through the night is agent time and no
+    # log can tell whether you were at the keyboard, so the label says what is
+    # actually measured rather than implying a person was there.
     rows = [
-        ("Total Time", f"{hours:.1f} hrs"),
+        ("Agent Time", format_hours(stats.total_minutes)),
         ("Sessions", str(stats.total_sessions)),
-        ("Messages", format_number(stats.total_messages)),
-        ("Tokens", format_number(stats.total_tokens.total)),
-        ("Favorite Model", escape(stats.favorite_model) if stats.favorite_model else "—"),
-        ("Peak Hour", f"{stats.peak_hour}:00"),
-        ("Active Agents", escape(", ".join(stats.active_agents)) or "—"),
-        ("Longest Session", f"{stats.longest_session_minutes:.0f} min"),
+        ("Active Days", str(stats.active_days)),
+        ("Top Model Family", escape(stats.favorite_model) if stats.favorite_model else "—"),
     ]
 
     row_svgs = []
     for i, (label, value) in enumerate(rows):
-        col_x = 20 if i < 4 else 270
-        row_y = 52 + (i % 4) * 22
+        row_y = 52 + i * 22
         row_svgs.append(
-            f'<text x="{col_x}" y="{row_y}" fill="{c["muted"]}" '
+            f'<text x="20" y="{row_y}" fill="{c["muted"]}" '
             f'font-size="12">{label}:</text>'
-            f'<text x="{col_x + 120}" y="{row_y}" fill="{c["text"]}" '
+            f'<text x="170" y="{row_y}" fill="{c["text"]}" '
             f'font-size="12" font-weight="600">{value}</text>'
         )
 
     body = "\n    ".join(row_svgs)
-    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="495" height="155" viewBox="0 0 495 155">
-  <rect width="493" height="153" x="1" y="1" rx="4.5" fill="{c["bg"]}" stroke="{c["border"]}"/>
+    footer = f"Last {stats.days_covered} complete days · Updated {stats.generated_at.date()}"
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="495" height="158" viewBox="0 0 495 158">
+  <rect width="493" height="156" x="1" y="1" rx="4.5" fill="{c["bg"]}" stroke="{c["border"]}"/>
   <text x="20" y="30" fill="{c["title"]}" font-size="16" font-weight="700" font-family="Arial, Helvetica, sans-serif">
     ⏱ Vibe Clock Stats
   </text>
@@ -61,4 +64,7 @@ def render_card(stats: AgentStats, theme: str = "dark") -> str:
   <g font-family="Courier New, Courier, monospace">
     {body}
   </g>
+  <text x="20" y="146" fill="{c["muted"]}" font-size="10" font-family="Arial, Helvetica, sans-serif">
+    {footer}
+  </text>
 </svg>'''
